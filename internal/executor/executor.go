@@ -49,12 +49,61 @@ type Executor struct {
 
 	notifyMu         sync.Mutex
 	lastCookieNotify map[string]time.Time
+
+	cancelMu  sync.Mutex
+	active    map[string]*activeJob // jobID -> running job (for /stop)
+	cancelled map[string]bool       // jobs cancelled by their owner
+}
+
+// activeJob pairs a running job with the context cancel that kills it.
+type activeJob struct {
+	job    *queue.Job
+	cancel context.CancelFunc
 }
 
 // SetRedisClient wires the queue's Redis client so the executor can track
 // in-flight jobs for crash recovery.
 func (e *Executor) SetRedisClient(client *redis.Client) {
 	e.redis = client
+}
+
+// trackJob registers a running job for /stop lookups.
+func (e *Executor) trackJob(job *queue.Job, cancel context.CancelFunc) {
+	e.cancelMu.Lock()
+	e.active[job.ID] = &activeJob{job: job, cancel: cancel}
+	e.cancelMu.Unlock()
+}
+
+func (e *Executor) untrackJob(jobID string) {
+	e.cancelMu.Lock()
+	delete(e.active, jobID)
+	delete(e.cancelled, jobID)
+	e.cancelMu.Unlock()
+}
+
+func (e *Executor) isCancelled(jobID string) bool {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	return e.cancelled[jobID]
+}
+
+// CancelByUser cancels every active job requested by this Telegram user and
+// returns short descriptions of what was stopped. Jobs requested by others
+// are never touched.
+func (e *Executor) CancelByUser(userID int64) []string {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+
+	var stopped []string
+	for id, a := range e.active {
+		if a.job.FromID != userID {
+			continue
+		}
+		e.cancelled[id] = true
+		a.cancel()
+		stopped = append(stopped, truncForStatus(a.job.URL, 60))
+	}
+	return stopped
 }
 
 func NewExecutor(cfg *config.Config, armOptimized bool) *Executor {
@@ -82,6 +131,8 @@ func NewExecutor(cfg *config.Config, armOptimized bool) *Executor {
 		armOptimized:     armOptimized,
 		botAPI:           botAPI,
 		lastCookieNotify: make(map[string]time.Time),
+		active:           make(map[string]*activeJob),
+		cancelled:        make(map[string]bool),
 	}
 
 	// Initialize thermal monitor on ARM64 if requested
@@ -234,24 +285,29 @@ func (e *Executor) Worker(ctx context.Context, q queue.Queue, drain <-chan struc
 		}
 		backoff = time.Second
 
-		// A playlist downloads dozens of videos one by one: it needs a
-		// much longer budget than a single file.
-		timeout := jobTimeout
-		if job.IsPlaylist {
-			timeout = playlistJobTimeout
+		// Single files get a hard timeout; playlists set an adaptive one
+		// inside processPlaylistJob once the entry count is known (a
+		// 500-video job legitimately runs for many hours).
+		jobCtx := ctx
+		cancel := func() {}
+		if !job.IsPlaylist {
+			jobCtx, cancel = context.WithTimeout(ctx, jobTimeout)
 		}
-		jobCtx, cancel := context.WithTimeout(ctx, timeout)
 
 		e.markInflight(job)
+		e.trackJob(job, cancel)
 		e.processJobSafe(jobCtx, job, func() {
 			e.processJob(jobCtx, job)
 		})
 		// Keep the inflight record when the job was interrupted (shutdown
 		// grace exceeded or yt-dlp wedged past the timeout): the next start
-		// re-enqueues it. Only finished jobs are cleared.
-		if jobCtx.Err() == nil {
+		// re-enqueues it. Jobs the owner cancelled via /stop must NOT
+		// resurrect — only finished jobs are cleared.
+		wasCancelled := e.isCancelled(job.ID)
+		if jobCtx.Err() == nil || wasCancelled {
 			e.clearInflight(job.ID)
 		}
+		e.untrackJob(job.ID)
 		cancel()
 	}
 }
@@ -277,6 +333,11 @@ func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
 	if !jobIDRe.MatchString(job.ID) {
 		log.Printf("Rejecting job with malformed ID %q", job.ID)
 		e.sendMessage(job.ChatID, "❌ Некорректная задача.")
+		return
+	}
+
+	// The owner cancelled this job while it sat in the queue.
+	if e.isCancelled(job.ID) {
 		return
 	}
 
@@ -321,6 +382,9 @@ func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
 	// Download media (video or audio)
 	media, err := e.downloadMedia(ctx, job.URL, job.ID, quality, mediaType)
 	if err != nil {
+		if e.isCancelled(job.ID) {
+			return // /stop already confirmed the cancellation to the user
+		}
 		log.Printf("Download error: %v", err)
 		e.notifyAdminCookiesStale(job.URL, err)
 		userMsg := "❌ Ошибка при скачивании.\n\nВозможные причины:\n• Неверная ссылка\n• Видео недоступно\n• Проблемы с сетью\n• Недостаточно памяти\n\nПопробуйте другую ссылку или повторите позже."
@@ -363,15 +427,189 @@ func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
 // tmpfs space IS device memory: a download that fails halfway through an
 // oversubscribed tmpfs can OOM-kill the whole box.
 func (e *Executor) checkTmpfsFree() error {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(e.config.TmpfsPath, &stat); err != nil {
-		return fmt.Errorf("statfs %s: %w", e.config.TmpfsPath, err)
-	}
-	freeMB := int(stat.Bavail * uint64(stat.Bsize) / (1024 * 1024))
-	if freeMB < e.config.MinFreeTmpfsMB {
-		return fmt.Errorf("tmpfs has %d MB free, need %d MB", freeMB, e.config.MinFreeTmpfsMB)
+	if err := e.checkDirFree(e.config.TmpfsPath, int64(e.config.MinFreeTmpfsMB)); err != nil {
+		return fmt.Errorf("tmpfs: %w", err)
 	}
 	return nil
+}
+
+// checkDirFree makes sure the filesystem holding path has at least minMB of
+// free space. Used for tmpfs (RAM) and for the disk directory holding
+// playlist archive parts.
+func (e *Executor) checkDirFree(path string, minMB int64) error {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return fmt.Errorf("statfs %s: %w", path, err)
+	}
+	freeMB := int64(stat.Bavail) * stat.Bsize / (1024 * 1024)
+	if freeMB < minMB {
+		return fmt.Errorf("%s has %d MB free, need %d MB", path, freeMB, minMB)
+	}
+	return nil
+}
+
+// playlistBudget estimates the wall-clock budget for a playlist job: ~90s per
+// item (download plus delivery) on this device, at least playlistJobTimeout,
+// at most 12 hours.
+func playlistBudget(items int) time.Duration {
+	budget := time.Duration(items) * 90 * time.Second
+	if budget < playlistJobTimeout {
+		budget = playlistJobTimeout
+	}
+	if budget > 12*time.Hour {
+		budget = 12 * time.Hour
+	}
+	return budget
+}
+
+// cleanupStaleArchives removes the given job's leftover parts plus any
+// archive file older than a day (a crashed job can leave a part behind).
+func (e *Executor) cleanupStaleArchives(jobID string) {
+	entries, err := os.ReadDir(e.config.ArchiveDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if strings.Contains(entry.Name(), jobID) || time.Since(info.ModTime()) > 24*time.Hour {
+			os.Remove(filepath.Join(e.config.ArchiveDir, entry.Name()))
+		}
+	}
+}
+
+// archiveBuilder assembles a multi-part ZIP on disk, sending and deleting
+// each part as soon as it is full: tmpfs is RAM-backed and too small for a
+// multi-GB archive, and the disk never holds more than one part at a time.
+type archiveBuilder struct {
+	e         *Executor
+	job       *queue.Job
+	label     string
+	partLimit int64
+
+	partNo   int // 1-based, counts parts of this run
+	file     *os.File
+	writer   *zip.Writer
+	path     string // disk name while writing: <jobID>.partNN.zip
+	bytes    int64
+	firstPos int // absolute playlist position of the part's first item
+	lastPos  int
+}
+
+func newArchiveBuilder(e *Executor, job *queue.Job, label string, partLimit int64) *archiveBuilder {
+	return &archiveBuilder{e: e, job: job, label: label, partLimit: partLimit, partNo: 1}
+}
+
+// wouldOverflow reports whether an item of the given size would push the
+// current part past the part-size limit.
+func (a *archiveBuilder) wouldOverflow(size int64) bool {
+	return a.file != nil && a.bytes+size > a.partLimit
+}
+
+// append adds a downloaded file to the current part, opening a new part file
+// if none is open. The caller checks wouldOverflow first.
+func (a *archiveBuilder) append(path, title string, pos int, size int64) error {
+	if a.file == nil {
+		if err := a.openPart(); err != nil {
+			return err
+		}
+		a.firstPos = pos
+	}
+	if err := a.e.appendMediaToZip(a.writer, path, title, pos); err != nil {
+		return err
+	}
+	a.bytes += size
+	a.lastPos = pos
+	return nil
+}
+
+func (a *archiveBuilder) openPart() error {
+	a.path = filepath.Join(a.e.config.ArchiveDir, fmt.Sprintf("%s.part%02d.zip", a.job.ID, a.partNo))
+	file, err := os.Create(a.path)
+	if err != nil {
+		return err
+	}
+	a.file = file
+	a.writer = zip.NewWriter(file)
+	a.bytes = 0
+	return nil
+}
+
+// sealAndSend closes the current part, renames it to a user-friendly name,
+// sends it as a document and deletes it. A no-op when nothing was appended.
+// The inflight resume point advances to the part's last item only after a
+// successful send.
+func (a *archiveBuilder) sealAndSend() error {
+	if a.file == nil {
+		return nil
+	}
+	if err := a.writer.Close(); err != nil {
+		a.file.Close()
+		os.Remove(a.path)
+		a.reset()
+		return fmt.Errorf("close zip: %w", err)
+	}
+	if err := a.file.Close(); err != nil {
+		os.Remove(a.path)
+		a.reset()
+		return fmt.Errorf("close zip file: %w", err)
+	}
+
+	display := filepath.Join(a.e.config.ArchiveDir, fmt.Sprintf(
+		"%s.часть-%02d.видео-%03d-%03d.zip", sanitizeFilename(a.label), a.partNo, a.firstPos, a.lastPos))
+	os.Remove(display)
+	if err := os.Rename(a.path, display); err != nil {
+		os.Remove(a.path)
+		a.reset()
+		return fmt.Errorf("rename part: %w", err)
+	}
+
+	caption := fmt.Sprintf("📋 %s — архив %d (видео %d–%d)", a.label, a.partNo, a.firstPos, a.lastPos)
+	sendErr := a.e.sendDocument(a.job.ChatID, display, caption)
+	os.Remove(display)
+	a.reset()
+	if sendErr != nil {
+		return sendErr
+	}
+	a.e.updateInflightProgress(a.job, a.lastPos)
+	return nil
+}
+
+// reset drops the closed part state so the next append opens a new one.
+func (a *archiveBuilder) reset() {
+	a.file = nil
+	a.writer = nil
+	a.path = ""
+	a.bytes = 0
+	a.firstPos = 0
+	a.lastPos = 0
+	a.partNo++
+}
+
+// discard closes and removes an open part whose write failed halfway; the
+// items inside it are lost for this run.
+func (a *archiveBuilder) discard() {
+	if a.file != nil {
+		a.file.Close()
+		os.Remove(a.path)
+	}
+	a.reset()
+}
+
+// cleanup removes an unsent part file left open when the job ends early.
+// Safe on a nil builder (sequential deliveries have no archive).
+func (a *archiveBuilder) cleanup() {
+	if a == nil || a.file == nil {
+		return
+	}
+	a.writer.Close()
+	a.file.Close()
+	os.Remove(a.path)
 }
 
 // playlistEntry is one video of a flat-playlist listing.
@@ -472,17 +710,18 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		return
 	}
 
+	// Donors (the admin) have no item cap.
 	truncatedNote := ""
-	if e.config.PlaylistMaxItems > 0 && total > e.config.PlaylistMaxItems {
+	if !job.FromDonor && e.config.PlaylistMaxItems > 0 && total > e.config.PlaylistMaxItems {
 		entries = entries[:e.config.PlaylistMaxItems]
 		truncatedNote = fmt.Sprintf("\n⚠️ В плейлисте %d видео — беру первые %d.", total, len(entries))
 	}
 
-	// Crash recovery: sequential deliveries skip the items already delivered
-	// before the restart. ZIP archives are rebuilt from scratch — a
-	// half-written archive does not survive the job cleanup.
+	// Crash recovery: deliveries skip the items already sent before the
+	// restart. For ZIPs the resume point only covers fully sent parts — a
+	// half-written part is corrupt and gets rebuilt.
 	resumeFrom := 0
-	if job.Delivery != "zip" && job.ResumeFrom > 0 {
+	if job.ResumeFrom > 0 {
 		if job.ResumeFrom >= len(entries) {
 			e.sendMessage(job.ChatID, "✅ Все видео этого плейлиста уже были отправлены до перезапуска.")
 			return
@@ -502,25 +741,40 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 	}
 	statusID := e.sendStatusMessage(job.ChatID, statusText)
 
-	// In zip mode the archive lives in tmpfs too; it is cleaned up no matter
-	// how the job ends.
-	var zipFile *os.File
-	var zipWriter *zip.Writer
-	zipPath := filepath.Join(e.config.TmpfsPath, job.ID+".zip")
-	defer os.Remove(zipPath)
+	// Adaptive budget: a 261-video job legitimately runs for hours, so the
+	// fixed single-file timeout does not apply here.
+	plexCtx, cancelBudget := context.WithTimeout(ctx, playlistBudget(count+resumeFrom))
+	defer cancelBudget()
+
+	// Archive parts are written to disk (tmpfs is RAM-backed and far too
+	// small for a 1.9 GB part) and sent one by one as they fill up.
+	var arch *archiveBuilder
+	partLimitMB := int64(e.config.ArchivePartSizeMB)
 	if job.Delivery == "zip" {
-		zipFile, err = os.Create(zipPath)
-		if err != nil {
-			log.Printf("Playlist zip create error: %v", err)
-			e.sendMessage(job.ChatID, "❌ Не удалось создать архив.")
+		if err := os.MkdirAll(e.config.ArchiveDir, 0700); err != nil {
+			log.Printf("Playlist archive dir error: %v", err)
+			e.sendMessage(job.ChatID, "❌ Не удалось создать папку для архивов.")
 			return
 		}
-		defer zipFile.Close()
-		zipWriter = zip.NewWriter(zipFile)
+		e.cleanupStaleArchives(job.ID)
+		if partLimitMB <= 0 || partLimitMB*1024*1024 > e.config.MaxFileSize {
+			partLimitMB = e.config.MaxFileSize / (1024 * 1024)
+		}
+		arch = newArchiveBuilder(e, job, label, partLimitMB*1024*1024)
 	}
+	// An unsent, half-written part is useless — drop it however the job ends.
+	defer arch.cleanup()
 
 	sent, failures := 0, 0
+	var skipNotes []string
+	cancelled := false
 	for i, entry := range entries {
+		// /stop: stop taking new items; already delivered parts stay.
+		if e.isCancelled(job.ID) {
+			cancelled = true
+			break
+		}
+
 		// pos is the item's 1-based position in the whole playlist: item IDs,
 		// archive entry numbering and the crash-resume point all use it.
 		pos := resumeFrom + i + 1
@@ -535,30 +789,71 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		e.editStatus(job.ChatID, statusID, fmt.Sprintf("⏳ Скачиваю %d/%d: %s", pos, resumeFrom+count, truncForStatus(entry.Title, 60)))
 
 		itemID := fmt.Sprintf("%s_%03d", job.ID, pos)
-		media, err := e.downloadMedia(ctx, entry.URL, itemID, quality, mediaType)
+		media, err := e.downloadMedia(plexCtx, entry.URL, itemID, quality, mediaType)
 		if err != nil {
+			if e.isCancelled(job.ID) {
+				cancelled = true
+				break
+			}
 			log.Printf("Playlist item %d error: %v", pos, err)
 			failures++
 			continue
 		}
 
-		if zipWriter != nil {
+		if arch != nil {
+			mediaSize := int64(0)
+			if stat, statErr := os.Stat(media.path); statErr == nil {
+				mediaSize = stat.Size()
+			}
+
+			// One video bigger than a part cannot fit Telegram at all.
+			if mediaSize > arch.partLimit {
+				os.Remove(media.path)
+				if media.thumb != "" {
+					os.Remove(media.thumb)
+				}
+				failures++
+				skipNotes = append(skipNotes, fmt.Sprintf("видео %d (%s): %.1f ГБ — больше лимита Telegram", pos, truncForStatus(entry.Title, 30), float64(mediaSize)/1e9))
+				continue
+			}
+
+			// Ship the current part when the next item would not fit.
+			if arch.wouldOverflow(mediaSize) {
+				e.editStatus(job.ChatID, statusID, fmt.Sprintf("📦 Отправляю архив %d (видео %d–%d)…", arch.partNo, arch.firstPos, arch.lastPos))
+				if err := arch.sealAndSend(); err != nil {
+					log.Printf("Playlist part send error: %v", err)
+					e.finishPlaylistStatus(job.ChatID, statusID, "❌ Ошибка при отправке архива.")
+					return
+				}
+			}
+
+			// Room for the new part plus a small margin.
+			if err := e.checkDirFree(e.config.ArchiveDir, partLimitMB+200); err != nil {
+				os.Remove(media.path)
+				if media.thumb != "" {
+					os.Remove(media.thumb)
+				}
+				log.Printf("Playlist %s stopped: %v", job.ID, err)
+				e.finishPlaylistStatus(job.ChatID, statusID, fmt.Sprintf("💾 Остановлено: мало места на диске.\n✅ Успешно: %d из %d.", sent, count))
+				return
+			}
+
 			title := media.title
 			if title == "" {
 				title = entry.Title
 			}
-			err = e.appendMediaToZip(zipWriter, media.path, title, pos)
+			err = arch.append(media.path, title, pos, mediaSize)
 			os.Remove(media.path)
 			if media.thumb != "" {
 				os.Remove(media.thumb)
 			}
 			if err != nil {
 				log.Printf("Playlist item %d zip error: %v", pos, err)
+				arch.discard()
 				failures++
 				continue
 			}
 			sent++
-			e.updateInflightProgress(job, pos)
 			continue
 		}
 
@@ -579,42 +874,44 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		}
 		sent++
 		e.updateInflightProgress(job, pos)
+
+		// Pause between items: hammering YouTube with back-to-back
+		// extractions gets the IP rate-limited, and one 429 poisons every
+		// request after it.
+		if i < len(entries)-1 {
+			time.Sleep(2 * time.Second)
+		}
 	}
 
 	if sent == 0 {
+		if cancelled {
+			e.finishPlaylistStatus(job.ChatID, statusID, "🛑 Остановлено по запросу — ни одно видео не было доставлено.")
+			return
+		}
 		e.finishPlaylistStatus(job.ChatID, statusID, "❌ Не удалось скачать ни одно видео из плейлиста.")
 		return
 	}
 
-	if zipWriter != nil {
-		e.editStatus(job.ChatID, statusID, "📦 Упаковываю архив…")
-		if err := zipWriter.Close(); err != nil {
-			log.Printf("Playlist zip close error: %v", err)
-			e.sendMessage(job.ChatID, "❌ Ошибка при создании архива.")
-			return
-		}
-		zipFile.Close()
-
-		stat, err := os.Stat(zipPath)
-		if err != nil {
-			e.sendMessage(job.ChatID, "❌ Ошибка при создании архива.")
-			return
-		}
-		if stat.Size() > e.config.MaxFileSize {
-			e.sendMessage(job.ChatID, fmt.Sprintf("❌ Архив слишком большой (%.1f ГБ) для Telegram (лимит %.0f ГБ). Попробуй качество поменьше или доставку по очереди.",
-				float64(stat.Size())/1e9, float64(e.config.MaxFileSize)/1e9))
-			return
-		}
-		if err := e.sendDocument(job.ChatID, zipPath, fmt.Sprintf("📋 %s — %d видео", label, sent)); err != nil {
-			log.Printf("Playlist zip send error: %v", err)
-			e.sendMessage(job.ChatID, "❌ Ошибка при отправке архива.")
+	if arch != nil {
+		e.editStatus(job.ChatID, statusID, fmt.Sprintf("📦 Отправляю архив %d (видео %d–%d)…", arch.partNo, arch.firstPos, arch.lastPos))
+		if err := arch.sealAndSend(); err != nil {
+			log.Printf("Playlist part send error: %v", err)
+			e.finishPlaylistStatus(job.ChatID, statusID, "❌ Ошибка при отправке архива.")
 			return
 		}
 	}
 
-	summary := fmt.Sprintf("✅ Готово: %d из %d.", sent, count)
+	var summary string
+	if cancelled {
+		summary = fmt.Sprintf("🛑 Остановлено по запросу: доставлено %d из %d.", sent, count)
+	} else {
+		summary = fmt.Sprintf("✅ Готово: %d из %d.", sent, count)
+	}
 	if failures > 0 {
 		summary += fmt.Sprintf(" (ошибок: %d)", failures)
+	}
+	for _, note := range skipNotes {
+		summary += "\n⚠️ " + note
 	}
 	e.finishPlaylistStatus(job.ChatID, statusID, summary)
 }

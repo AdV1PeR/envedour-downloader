@@ -28,6 +28,8 @@ type Job struct {
 	IsPlaylist bool   `json:"is_playlist,omitempty"` // URL is a whole YouTube playlist
 	Delivery   string `json:"delivery,omitempty"`    // playlists: "sequential" or "zip"
 	ResumeFrom int    `json:"resume_from,omitempty"` // playlists: skip items before this index (crash recovery)
+	FromDonor  bool   `json:"from_donor,omitempty"`  // requester is a donor: bypass item/queue limits
+	FromID     int64  `json:"from_id,omitempty"`     // Telegram user ID of the requester (for /stop)
 }
 
 type Queue interface {
@@ -35,7 +37,8 @@ type Queue interface {
 	Dequeue(ctx context.Context) (*Job, error)
 	GetStatus() int
 	Close() error
-	GetClient() *redis.Client // For accessing Redis client for preferences
+	GetClient() *redis.Client                 // For accessing Redis client for preferences
+	RemoveMatching(match func(*Job) bool) int // Drop queued jobs the filter accepts
 }
 
 type RedisQueue struct {
@@ -122,6 +125,29 @@ func (q *RedisQueue) GetStatus() int {
 	highCount := q.client.LLen(q.ctx, "queue:high").Val()
 	lowCount := q.client.LLen(q.ctx, "queue:low").Val()
 	return int(highCount + lowCount)
+}
+
+// RemoveMatching drops every queued job the filter accepts (used by /stop to
+// pull a user's pending requests out of the queue). Returns how many jobs
+// were removed.
+func (q *RedisQueue) RemoveMatching(match func(*Job) bool) int {
+	removed := 0
+	for _, name := range []string{"queue:high", "queue:low"} {
+		items, err := q.client.LRange(q.ctx, name, 0, -1).Result()
+		if err != nil {
+			continue
+		}
+		for _, item := range items {
+			var job Job
+			if json.Unmarshal([]byte(item), &job) != nil || !match(&job) {
+				continue
+			}
+			if q.client.LRem(q.ctx, name, 1, item).Err() == nil {
+				removed++
+			}
+		}
+	}
+	return removed
 }
 
 func (q *RedisQueue) Close() error {

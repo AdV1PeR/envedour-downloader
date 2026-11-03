@@ -2,6 +2,7 @@ package executor
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"envedour-bot/internal/config"
@@ -560,5 +562,121 @@ func TestProcessJobSafe(t *testing.T) {
 	})
 	if !ran {
 		t.Fatal("normal job must run")
+	}
+}
+
+func TestPlaylistBudget(t *testing.T) {
+	if got := playlistBudget(0); got != playlistJobTimeout {
+		t.Fatalf("playlistBudget(0) = %v, want the %v floor", got, playlistJobTimeout)
+	}
+	if got := playlistBudget(5); got != playlistJobTimeout {
+		t.Fatalf("playlistBudget(5) = %v, want the %v floor", got, playlistJobTimeout)
+	}
+	if got := playlistBudget(100); got != 150*time.Minute {
+		t.Fatalf("playlistBudget(100) = %v, want 150m (90s per item)", got)
+	}
+	if got := playlistBudget(100000); got != 12*time.Hour {
+		t.Fatalf("playlistBudget(100000) = %v, want the 12h cap", got)
+	}
+}
+
+func TestArchiveBuilderRotation(t *testing.T) {
+	dir := t.TempDir()
+	e := &Executor{config: &config.Config{ArchiveDir: dir}}                       // nil botAPI: sends fail
+	b := newArchiveBuilder(e, &queue.Job{ID: "job_5", ChatID: 1}, "My Mix", 1000) // 1000-byte parts
+
+	zipCount := func() int {
+		entries, _ := os.ReadDir(dir)
+		n := 0
+		for _, en := range entries {
+			if strings.HasSuffix(en.Name(), ".zip") {
+				n++
+			}
+		}
+		return n
+	}
+
+	writeItem := func(name string, size int) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, bytes.Repeat([]byte("x"), size), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	// Item 1 (600 bytes) fits into the empty 1000-byte part.
+	if b.wouldOverflow(600) {
+		t.Fatal("empty part must not overflow")
+	}
+	if err := b.append(writeItem("a.mp4", 600), "a", 1, 600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(b.path); err != nil {
+		t.Fatalf("part file missing: %v", err)
+	}
+
+	// Item 2 (500 bytes) does not fit next to 600 bytes → rotation needed.
+	if !b.wouldOverflow(500) {
+		t.Fatal("600+500 must overflow a 1000-byte part")
+	}
+	if err := b.sealAndSend(); err == nil {
+		t.Fatal("sealAndSend must fail with a nil botAPI")
+	}
+	// After the failed send the builder is reset and the part file removed.
+	if b.partNo != 2 || b.file != nil || b.bytes != 0 {
+		t.Fatalf("builder not reset: partNo=%d file=%v bytes=%d", b.partNo, b.file, b.bytes)
+	}
+	if n := zipCount(); n != 0 {
+		t.Fatalf("part files left behind: %d", n)
+	}
+
+	// The new part accepts the item again.
+	if b.wouldOverflow(500) {
+		t.Fatal("fresh part must not overflow")
+	}
+	if err := b.append(writeItem("b.mp4", 500), "b", 2, 500); err != nil {
+		t.Fatal(err)
+	}
+	b.cleanup()
+	if n := zipCount(); n != 0 {
+		t.Fatalf("cleanup must remove the unsent part, left %d", n)
+	}
+}
+
+func TestCancelByUser(t *testing.T) {
+	e := &Executor{
+		config:    &config.Config{},
+		active:    make(map[string]*activeJob),
+		cancelled: make(map[string]bool),
+	}
+
+	_, cancelA := context.WithCancel(context.Background())
+	_, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	e.trackJob(&queue.Job{ID: "job_1", FromID: 100, URL: "https://example.com/a"}, cancelA)
+	e.trackJob(&queue.Job{ID: "job_2", FromID: 200, URL: "https://example.com/b"}, cancelB)
+
+	// Cancelling user 100 must not touch user 200's job.
+	stopped := e.CancelByUser(100)
+	if len(stopped) != 1 || stopped[0] != "https://example.com/a" {
+		t.Fatalf("CancelByUser(100) = %v", stopped)
+	}
+	if !e.isCancelled("job_1") {
+		t.Fatal("job_1 must be marked cancelled")
+	}
+	if e.isCancelled("job_2") {
+		t.Fatal("job_2 belongs to another user and must not be cancelled")
+	}
+	cancelA() // satisfied: the context cancel fired and must not leak
+
+	// Another user has nothing to stop.
+	if got := e.CancelByUser(300); len(got) != 0 {
+		t.Fatalf("CancelByUser(300) = %v, want empty", got)
+	}
+
+	// Untracking clears the cancelled flag together with the active entry.
+	e.untrackJob("job_1")
+	if e.isCancelled("job_1") {
+		t.Fatal("cancelled flag must be cleared on untrack")
 	}
 }

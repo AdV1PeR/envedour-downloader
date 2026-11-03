@@ -149,6 +149,7 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool) {
 	case "help":
 		helpText := "📋 Справка:\n\n" +
 			"💡 Просто отправь ссылку на видео для скачивания!\n\n" +
+			"🛑 /stop - остановить свои загрузки\n\n" +
 			"Используй кнопки для настройки качества и типа медиа.\n\n" +
 			"⚙️ Качество - выбери разрешение видео\n" +
 			"🎵 Аудио/Видео - выбери тип скачивания\n" +
@@ -159,6 +160,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool) {
 		return
 	case "status":
 		b.showStatus(chatID)
+	case "stop", "cancel":
+		b.handleStop(msg)
 	case "quality", "audio", "video":
 		// These commands are now handled via inline buttons
 		// Show main menu
@@ -167,6 +170,38 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool) {
 		b.api.Send(msg)
 	default:
 		b.sendMessage(chatID, "❌ Неизвестная команда. Используйте /help")
+	}
+}
+
+// handleStop stops everything the caller started: queued requests are pulled
+// out of the queue, running ones are cancelled in the executor. Nobody can
+// touch anyone else's jobs.
+func (b *Bot) handleStop(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	userID := int64(0)
+	if msg.From != nil {
+		userID = msg.From.ID
+	}
+
+	queued := b.queue.RemoveMatching(func(j *queue.Job) bool {
+		return j.FromID == userID
+	})
+	stopped := b.executor.CancelByUser(userID)
+
+	switch {
+	case queued == 0 && len(stopped) == 0:
+		b.sendMessage(chatID, "🛑 Твоих активных загрузок нет.")
+	case len(stopped) == 0:
+		b.sendMessage(chatID, fmt.Sprintf("🛑 Остановлено: убрано из очереди — %d.", queued))
+	default:
+		text := fmt.Sprintf("🛑 Остановлено: активных загрузок — %d", len(stopped))
+		for _, s := range stopped {
+			text += "\n  • " + s
+		}
+		if queued > 0 {
+			text += fmt.Sprintf("\n• убрано из очереди: %d", queued)
+		}
+		b.sendMessage(chatID, text)
 	}
 }
 
@@ -230,9 +265,11 @@ func (b *Bot) handleURL(msg *tgbotapi.Message, isDonor bool) {
 
 		if isDonor {
 			job.Priority = queue.PriorityHigh
+			job.FromDonor = true
 		}
+		job.FromID = senderID
 
-		if err := b.enqueueJob(job); err != nil {
+		if err := b.enqueueJob(job, isDonor); err != nil {
 			b.sendMessage(chatID, err.Error())
 		}
 		return
@@ -325,9 +362,10 @@ func isYouTubePlaylistURL(rawURL string) bool {
 }
 
 // enqueueJob applies the queue-depth cap and enqueues the job. The returned
-// error carries a user-facing message.
-func (b *Bot) enqueueJob(job *queue.Job) error {
-	if b.config.MaxQueueSize > 0 && b.queue.GetStatus() >= b.config.MaxQueueSize {
+// error carries a user-facing message. Donor jobs bypass the cap: the admin
+// must never be blocked by other people's backlog.
+func (b *Bot) enqueueJob(job *queue.Job, isDonor bool) error {
+	if !isDonor && b.config.MaxQueueSize > 0 && b.queue.GetStatus() >= b.config.MaxQueueSize {
 		return fmt.Errorf("⚠️ Очередь переполнена, попробуйте позже")
 	}
 	if err := b.queue.Enqueue(job); err != nil {
@@ -484,6 +522,14 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			return
 		}
 
+		// Donor status follows the clicker, not the chat: in groups the
+		// admin must keep donor perks.
+		isDonor := b.isDonor(chatID) || (query.From != nil && b.isDonor(query.From.ID))
+		var senderID int64
+		if query.From != nil {
+			senderID = query.From.ID
+		}
+
 		// Create job
 		job := &queue.Job{
 			ID:        generateJobID(),
@@ -493,14 +539,16 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			Quality:   qualityPart,
 			MediaType: mediaType,
 			CreatedAt: time.Now(),
+			FromID:    senderID,
 		}
 
-		if b.isDonor(chatID) {
+		if isDonor {
 			job.Priority = queue.PriorityHigh
+			job.FromDonor = true
 		}
 
 		// Add to queue
-		if err := b.enqueueJob(job); err != nil {
+		if err := b.enqueueJob(job, isDonor); err != nil {
 			b.sendMessage(chatID, err.Error())
 			return
 		}
@@ -546,6 +594,13 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			mediaType = "video"
 		}
 
+		// Donor status follows the clicker, not the chat.
+		isDonor := b.isDonor(chatID) || (query.From != nil && b.isDonor(query.From.ID))
+		var senderID int64
+		if query.From != nil {
+			senderID = query.From.ID
+		}
+
 		job := &queue.Job{
 			ID:         generateJobID(),
 			URL:        pending.URL,
@@ -556,13 +611,15 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			CreatedAt:  time.Now(),
 			IsPlaylist: true,
 			Delivery:   delivery,
+			FromID:     senderID,
 		}
 
-		if b.isDonor(chatID) {
+		if isDonor {
 			job.Priority = queue.PriorityHigh
+			job.FromDonor = true
 		}
 
-		if err := b.enqueueJob(job); err != nil {
+		if err := b.enqueueJob(job, isDonor); err != nil {
 			b.sendMessage(chatID, err.Error())
 			return
 		}

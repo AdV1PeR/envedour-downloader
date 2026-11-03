@@ -31,6 +31,11 @@ type Config struct {
 	MaxQueueSize     int     // Reject new jobs beyond this queue depth (0 = no cap)
 	MinFreeTmpfsMB   int     // Stop downloading when tmpfs has less free space
 	PlaylistMaxItems int     // Cap on YouTube playlist length (0 = no cap)
+
+	// Playlist archives: parts are written to disk (tmpfs is RAM-backed and
+	// too small for multi-GB archives) and sent one by one.
+	ArchiveDir        string // Directory for playlist archive parts
+	ArchivePartSizeMB int    // Max size of one archive part (Telegram caps at 2 GB)
 }
 
 func Load() (*Config, error) {
@@ -72,6 +77,9 @@ func Load() (*Config, error) {
 		MaxQueueSize:     getEnvInt("MAX_QUEUE_SIZE", 20),
 		MinFreeTmpfsMB:   getEnvInt("MIN_FREE_TMPFS_MB", 300),
 		PlaylistMaxItems: getEnvInt("PLAYLIST_MAX_ITEMS", 50),
+
+		ArchiveDir:        getEnv("ARCHIVE_DIR", "/opt/envedour-bot/archives"),
+		ArchivePartSizeMB: getEnvInt("ARCHIVE_PART_SIZE_MB", 1900),
 	}
 
 	// Validate required fields
