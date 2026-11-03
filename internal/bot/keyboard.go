@@ -11,7 +11,7 @@ func createMainKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("⚙️ Качество", "menu_quality"),
-		tgbotapi.NewInlineKeyboardButtonData("🎵 Аудио/Видео", "menu_media"),
+			tgbotapi.NewInlineKeyboardButtonData("🎵 Аудио/Видео", "menu_media"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📊 Статус", "cmd_status"),
@@ -68,6 +68,17 @@ func createDownloadQualityKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("360p", fmt.Sprintf("dl_q_360p:%s", jobID)),
 			tgbotapi.NewInlineKeyboardButtonData("🎵 Аудио", fmt.Sprintf("dl_q_audio:%s", jobID)),
+		),
+	)
+}
+
+// createPlaylistDeliveryKeyboard asks how a playlist should be delivered once
+// the quality step is done.
+func createPlaylistDeliveryKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 По очереди", fmt.Sprintf("pl_seq:%s", jobID)),
+			tgbotapi.NewInlineKeyboardButtonData("📦 Архивом", fmt.Sprintf("pl_zip:%s", jobID)),
 		),
 	)
 }

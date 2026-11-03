@@ -21,9 +21,12 @@ type Job struct {
 	URL       string    `json:"url"`
 	ChatID    int64     `json:"chat_id"`
 	Priority  Priority  `json:"priority"`
-	Quality   string    `json:"quality"`   // "best", "1080p", "720p", "480p", "360p", "audio"
+	Quality   string    `json:"quality"`    // "best", "1080p", "720p", "480p", "360p", "audio"
 	MediaType string    `json:"media_type"` // "video" or "audio"
 	CreatedAt time.Time `json:"created_at"`
+
+	IsPlaylist bool   `json:"is_playlist,omitempty"` // URL is a whole YouTube playlist
+	Delivery   string `json:"delivery,omitempty"`    // playlists: "sequential" or "zip"
 }
 
 type Queue interface {

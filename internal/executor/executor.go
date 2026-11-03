@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -93,7 +94,10 @@ func NewExecutor(cfg *config.Config, armOptimized bool) *Executor {
 // jobTimeout bounds a single download+upload job. Without it a wedged
 // yt-dlp (network stall, interactive prompt) blocks a worker forever and,
 // with all workers wedged, silently idles the whole bot.
-const jobTimeout = 20 * time.Minute
+const (
+	jobTimeout         = 20 * time.Minute
+	playlistJobTimeout = 2 * time.Hour
+)
 
 func (e *Executor) Worker(ctx context.Context, q queue.Queue) {
 	for {
@@ -112,14 +116,31 @@ func (e *Executor) Worker(ctx context.Context, q queue.Queue) {
 				continue
 			}
 
-			jobCtx, cancel := context.WithTimeout(ctx, jobTimeout)
+			// A playlist downloads dozens of videos one by one: it needs a
+			// much longer budget than a single file.
+			timeout := jobTimeout
+			if job.IsPlaylist {
+				timeout = playlistJobTimeout
+			}
+			jobCtx, cancel := context.WithTimeout(ctx, timeout)
 			e.processJob(jobCtx, job)
 			cancel()
 		}
 	}
 }
 
+// jobIDRe matches IDs the bot generates: job_<unixnano>, plus the _NNN item
+// suffix playlist jobs add. File paths are built from the ID (output
+// template, glob, remux target), so anything else must never be processed.
+var jobIDRe = regexp.MustCompile(`^job_[0-9]+(_[0-9]{3})?$`)
+
 func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
+	if !jobIDRe.MatchString(job.ID) {
+		log.Printf("Rejecting job with malformed ID %q", job.ID)
+		e.sendMessage(job.ChatID, "❌ Некорректная задача.")
+		return
+	}
+
 	// Check thermal throttling if ARM optimized
 	if e.armOptimized && e.thermalMon != nil {
 		if e.thermalMon.IsThrottled() {
@@ -132,6 +153,19 @@ func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
 	// Check available memory
 	if err := e.checkMemory(); err != nil {
 		e.sendMessage(job.ChatID, "Недостаточно памяти на устройстве. Попробуйте позже.")
+		return
+	}
+
+	if job.IsPlaylist {
+		e.processPlaylistJob(ctx, job)
+		return
+	}
+
+	// Make sure the RAM-backed storage can hold another download; otherwise
+	// yt-dlp dies halfway through with a cryptic error (or OOM-kills the box).
+	if err := e.checkTmpfsFree(); err != nil {
+		log.Printf("Tmpfs space error: %v", err)
+		e.sendMessage(job.ChatID, "💾 На устройстве мало свободной памяти. Попробуйте позже.")
 		return
 	}
 
@@ -184,6 +218,336 @@ func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
 			return
 		}
 	}
+}
+
+// checkTmpfsFree makes sure the RAM-backed storage can hold another download.
+// tmpfs space IS device memory: a download that fails halfway through an
+// oversubscribed tmpfs can OOM-kill the whole box.
+func (e *Executor) checkTmpfsFree() error {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(e.config.TmpfsPath, &stat); err != nil {
+		return fmt.Errorf("statfs %s: %w", e.config.TmpfsPath, err)
+	}
+	freeMB := int(stat.Bavail * uint64(stat.Bsize) / (1024 * 1024))
+	if freeMB < e.config.MinFreeTmpfsMB {
+		return fmt.Errorf("tmpfs has %d MB free, need %d MB", freeMB, e.config.MinFreeTmpfsMB)
+	}
+	return nil
+}
+
+// playlistEntry is one video of a flat-playlist listing.
+type playlistEntry struct {
+	URL   string
+	Title string
+}
+
+// parsePlaylistListing parses `yt-dlp --flat-playlist --print` output: for
+// every entry three lines in flag order (url, entry title, playlist title).
+// Fields are JSON-encoded by yt-dlp (…j conversion) so titles containing
+// newlines or quotes cannot corrupt the line protocol.
+func parsePlaylistListing(out string) (playlistTitle string, entries []playlistEntry) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	decode := func(line string) string {
+		var s string
+		if err := json.Unmarshal([]byte(line), &s); err != nil {
+			// NA and malformed lines stay as-is.
+			return strings.TrimSpace(line)
+		}
+		return s
+	}
+	for i := 0; i+2 < len(lines); i += 3 {
+		u := decode(lines[i])
+		if u == "" || u == "NA" {
+			continue
+		}
+		title := decode(lines[i+1])
+		if title == "NA" {
+			title = ""
+		}
+		if playlistTitle == "" {
+			if pt := decode(lines[i+2]); pt != "" && pt != "NA" {
+				playlistTitle = pt
+			}
+		}
+		entries = append(entries, playlistEntry{URL: u, Title: title})
+	}
+	return playlistTitle, entries
+}
+
+// listPlaylist fetches a playlist's entries without downloading anything.
+func (e *Executor) listPlaylist(ctx context.Context, playlistURL string) ([]playlistEntry, string, error) {
+	args := []string{
+		"--flat-playlist",
+		"--no-cache-dir",
+		"--no-progress",
+		"--quiet",
+		"--print", "%(url)j",
+		"--print", "%(title)j",
+		"--print", "%(playlist_title)j",
+		"--no-cookies-from-browser",
+	}
+	if cookiesFile := e.getCookiesFile(playlistURL); cookiesFile != "" {
+		args = append(args, "--cookies", cookiesFile)
+	}
+	args = addYTDLPJavaScriptRuntime(args)
+	args = append(args, playlistURL)
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		detail := ""
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			detail = string(ee.Stderr)
+			if len(detail) > 4096 {
+				detail = detail[len(detail)-4096:]
+			}
+		}
+		return nil, "", fmt.Errorf("yt-dlp failed: %w\nOutput: %s", err, detail)
+	}
+	title, entries := parsePlaylistListing(string(out))
+	return entries, title, nil
+}
+
+// processPlaylistJob downloads a playlist one video at a time so tmpfs (RAM)
+// never holds more than a single file, delivering either each video straight
+// to the chat or everything as a store-mode (no recompression) ZIP archive.
+func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
+	quality := job.Quality
+	if quality == "" {
+		quality = "best"
+	}
+	mediaType := job.MediaType
+	if mediaType == "" {
+		mediaType = "video"
+	}
+
+	entries, playlistTitle, err := e.listPlaylist(ctx, job.URL)
+	if err != nil {
+		log.Printf("Playlist listing error: %v", err)
+		e.sendMessage(job.ChatID, "❌ Не удалось получить список видео из плейлиста.")
+		return
+	}
+	total := len(entries)
+	if total == 0 {
+		e.sendMessage(job.ChatID, "❌ В плейлисте не найдено видео.")
+		return
+	}
+
+	truncatedNote := ""
+	if e.config.PlaylistMaxItems > 0 && total > e.config.PlaylistMaxItems {
+		entries = entries[:e.config.PlaylistMaxItems]
+		truncatedNote = fmt.Sprintf("\n⚠️ В плейлисте %d видео — беру первые %d.", total, len(entries))
+	}
+	count := len(entries)
+
+	label := playlistTitle
+	if label == "" {
+		label = "Плейлист"
+	}
+	statusID := e.sendStatusMessage(job.ChatID, fmt.Sprintf("📋 «%s»: %d видео%s\n⏳ Скачиваю 1/%d…", label, count, truncatedNote, count))
+
+	// In zip mode the archive lives in tmpfs too; it is cleaned up no matter
+	// how the job ends.
+	var zipFile *os.File
+	var zipWriter *zip.Writer
+	zipPath := filepath.Join(e.config.TmpfsPath, job.ID+".zip")
+	defer os.Remove(zipPath)
+	if job.Delivery == "zip" {
+		zipFile, err = os.Create(zipPath)
+		if err != nil {
+			log.Printf("Playlist zip create error: %v", err)
+			e.sendMessage(job.ChatID, "❌ Не удалось создать архив.")
+			return
+		}
+		defer zipFile.Close()
+		zipWriter = zip.NewWriter(zipFile)
+	}
+
+	sent, failures := 0, 0
+	for i, entry := range entries {
+		// RAM guard: stop before tmpfs runs out instead of failing mid-download.
+		if err := e.checkTmpfsFree(); err != nil {
+			log.Printf("Playlist %s stopped: %v", job.ID, err)
+			e.finishPlaylistStatus(job.ChatID, statusID, fmt.Sprintf("💾 Остановлено: мало свободной памяти.\n✅ Успешно: %d из %d.", sent, count))
+			return
+		}
+
+		e.editStatus(job.ChatID, statusID, fmt.Sprintf("⏳ Скачиваю %d/%d: %s", i+1, count, truncForStatus(entry.Title, 60)))
+
+		itemID := fmt.Sprintf("%s_%03d", job.ID, i+1)
+		media, err := e.downloadMedia(ctx, entry.URL, itemID, quality, mediaType)
+		if err != nil {
+			log.Printf("Playlist item %d error: %v", i+1, err)
+			failures++
+			continue
+		}
+
+		if zipWriter != nil {
+			title := media.title
+			if title == "" {
+				title = entry.Title
+			}
+			err = e.appendMediaToZip(zipWriter, media.path, title, i+1)
+			os.Remove(media.path)
+			if media.thumb != "" {
+				os.Remove(media.thumb)
+			}
+			if err != nil {
+				log.Printf("Playlist item %d zip error: %v", i+1, err)
+				failures++
+				continue
+			}
+			sent++
+			continue
+		}
+
+		// Sequential delivery straight into the chat.
+		if mediaType == "audio" {
+			err = e.sendAudio(job.ChatID, media.path, media.thumb, media.title, probeDuration(media.path))
+		} else {
+			err = e.sendVideo(job.ChatID, media.path)
+		}
+		os.Remove(media.path)
+		if media.thumb != "" {
+			os.Remove(media.thumb)
+		}
+		if err != nil {
+			log.Printf("Playlist item %d send error: %v", i+1, err)
+			failures++
+			continue
+		}
+		sent++
+	}
+
+	if sent == 0 {
+		e.finishPlaylistStatus(job.ChatID, statusID, "❌ Не удалось скачать ни одно видео из плейлиста.")
+		return
+	}
+
+	if zipWriter != nil {
+		e.editStatus(job.ChatID, statusID, "📦 Упаковываю архив…")
+		if err := zipWriter.Close(); err != nil {
+			log.Printf("Playlist zip close error: %v", err)
+			e.sendMessage(job.ChatID, "❌ Ошибка при создании архива.")
+			return
+		}
+		zipFile.Close()
+
+		stat, err := os.Stat(zipPath)
+		if err != nil {
+			e.sendMessage(job.ChatID, "❌ Ошибка при создании архива.")
+			return
+		}
+		if stat.Size() > e.config.MaxFileSize {
+			e.sendMessage(job.ChatID, fmt.Sprintf("❌ Архив слишком большой (%.1f ГБ) для Telegram (лимит %.0f ГБ). Попробуй качество поменьше или доставку по очереди.",
+				float64(stat.Size())/1e9, float64(e.config.MaxFileSize)/1e9))
+			return
+		}
+		if err := e.sendDocument(job.ChatID, zipPath, fmt.Sprintf("📋 %s — %d видео", label, sent)); err != nil {
+			log.Printf("Playlist zip send error: %v", err)
+			e.sendMessage(job.ChatID, "❌ Ошибка при отправке архива.")
+			return
+		}
+	}
+
+	summary := fmt.Sprintf("✅ Готово: %d из %d.", sent, count)
+	if failures > 0 {
+		summary += fmt.Sprintf(" (ошибок: %d)", failures)
+	}
+	e.finishPlaylistStatus(job.ChatID, statusID, summary)
+}
+
+// appendMediaToZip copies a downloaded file into the playlist archive with
+// Store mode: no recompression, just lossless container copy.
+func (e *Executor) appendMediaToZip(w *zip.Writer, path, title string, index int) error {
+	name := fmt.Sprintf("%03d %s", index, title)
+	name = sanitizeFilename(name) + filepath.Ext(path)
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	header := &zip.FileHeader{Name: name, Method: zip.Store}
+	writer, err := w.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(writer, file)
+	return err
+}
+
+// truncForStatus makes a single-line, rune-safe status label.
+func truncForStatus(s string, max int) string {
+	s = strings.TrimSpace(strings.SplitN(s, "\n", 2)[0])
+	runes := []rune(s)
+	if len(runes) > max {
+		return string(runes[:max-1]) + "…"
+	}
+	if s == "" {
+		return "(без названия)"
+	}
+	return s
+}
+
+// sendStatusMessage sends a progress message and returns its ID for later
+// edits (0 when sending failed).
+func (e *Executor) sendStatusMessage(chatID int64, text string) int {
+	if e.botAPI == nil {
+		return 0
+	}
+	sent, err := e.botAPI.Send(tgbotapi.NewMessage(chatID, text))
+	if err != nil {
+		return 0
+	}
+	return sent.MessageID
+}
+
+// editStatus updates a progress message; failures are ignored.
+func (e *Executor) editStatus(chatID int64, messageID int, text string) {
+	if e.botAPI == nil || messageID == 0 {
+		return
+	}
+	e.botAPI.Send(tgbotapi.NewEditMessageText(chatID, messageID, text))
+}
+
+// finishPlaylistStatus edits the progress message, falling back to a plain
+// message when the original status could not be sent.
+func (e *Executor) finishPlaylistStatus(chatID int64, messageID int, text string) {
+	if messageID == 0 {
+		e.sendMessage(chatID, text)
+		return
+	}
+	e.editStatus(chatID, messageID, text)
+}
+
+// sendDocument uploads a file as a Telegram document with a caption.
+func (e *Executor) sendDocument(chatID int64, path, caption string) error {
+	if e.botAPI == nil {
+		return fmt.Errorf("bot API not initialized")
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
+	}
+	if stat.Size() > e.config.MaxFileSize {
+		return fmt.Errorf("file too large: %d bytes (max: %d)", stat.Size(), e.config.MaxFileSize)
+	}
+
+	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(path))
+	doc.Caption = caption
+	if _, err := e.botAPI.Send(doc); err != nil {
+		return fmt.Errorf("failed to send document: %w", err)
+	}
+	return nil
 }
 
 // cookieNotifyInterval throttles admin reminders: a burst of failing links
@@ -458,8 +822,8 @@ func ytdlpSupportsJSRuntimes() bool {
 // spawns a Python interpreter plus up to four version subprocesses, which on
 // a Cortex-A53 costs up to a second of pure CPU per download.
 var (
-	jsRuntimeOnce     sync.Once
-	cachedJSArgs      []string
+	jsRuntimeOnce sync.Once
+	cachedJSArgs  []string
 )
 
 func addYTDLPJavaScriptRuntime(args []string) []string {

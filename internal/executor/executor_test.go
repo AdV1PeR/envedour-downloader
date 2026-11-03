@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"archive/zip"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -411,5 +413,103 @@ func TestProbeDuration(t *testing.T) {
 	})
 	if got := probeDuration("/fake/audio.mp3"); got != 0 {
 		t.Fatalf("probeDuration on ffprobe failure = %d, want 0", got)
+	}
+}
+
+func TestParsePlaylistListing(t *testing.T) {
+	// yt-dlp prints each field JSON-encoded (…j conversion), three lines per
+	// entry: url, entry title, playlist title.
+	out := strings.Join([]string{
+		`"https://www.youtube.com/watch?v=aaa"`, `"First video"`, `"My Mix"`,
+		`"https://www.youtube.com/watch?v=bbb"`, `"Second \"quoted\" video"`, `"My Mix"`,
+		`"https://www.youtube.com/watch?v=ccc"`, `"NA"`, `"My Mix"`,
+		`""`, `"NA"`, `"NA"`, // entries without a URL are skipped
+	}, "\n")
+
+	title, entries := parsePlaylistListing(out)
+	if title != "My Mix" {
+		t.Fatalf("playlist title = %q, want %q", title, "My Mix")
+	}
+	if len(entries) != 3 {
+		t.Fatalf("got %d entries, want 3", len(entries))
+	}
+	if entries[0].URL != "https://www.youtube.com/watch?v=aaa" || entries[0].Title != "First video" {
+		t.Fatalf("entry 0 = %+v", entries[0])
+	}
+	if entries[1].Title != `Second "quoted" video` {
+		t.Fatalf("entry 1 title = %q", entries[1].Title)
+	}
+	if entries[2].Title != "" {
+		t.Fatalf("NA title must become empty, got %q", entries[2].Title)
+	}
+
+	if _, entries := parsePlaylistListing(""); len(entries) != 0 {
+		t.Fatalf("empty listing must produce no entries, got %d", len(entries))
+	}
+}
+
+func TestAppendMediaToZip(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "item.mp4")
+	if err := os.WriteFile(src, []byte("video-bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	zipPath := filepath.Join(dir, "out.zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(zf)
+	e := &Executor{}
+	if err := e.appendMediaToZip(w, src, "My | Video", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if len(r.File) != 1 {
+		t.Fatalf("zip has %d files, want 1", len(r.File))
+	}
+	if r.File[0].Name != "007 My Video.mp4" {
+		t.Fatalf("zip entry name = %q", r.File[0].Name)
+	}
+	if r.File[0].Method != zip.Store {
+		t.Fatalf("zip entry method = %d, want Store", r.File[0].Method)
+	}
+	rc, err := r.File[0].Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "video-bytes" {
+		t.Fatalf("zip entry content = %q", data)
+	}
+}
+
+func TestCheckTmpfsFree(t *testing.T) {
+	dir := t.TempDir()
+	e := &Executor{config: &config.Config{TmpfsPath: dir, MinFreeTmpfsMB: 0}}
+	if err := e.checkTmpfsFree(); err != nil {
+		t.Fatalf("MinFreeTmpfsMB=0 must always pass, got %v", err)
+	}
+
+	// An absurdly high requirement must fail on any real filesystem.
+	e.config.MinFreeTmpfsMB = 1 << 40
+	if err := e.checkTmpfsFree(); err == nil {
+		t.Fatal("expected an error with an impossible free-space requirement")
 	}
 }

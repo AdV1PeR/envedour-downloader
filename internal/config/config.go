@@ -24,6 +24,13 @@ type Config struct {
 	YouTubeCookies   string // Path to YouTube cookies file (Netscape format)
 	MinFreeMemMB     int    // Minimum free memory in MB (default: 256)
 	AdminChatID      int64  // Telegram chat for service reminders (0 = disabled)
+
+	// Anti-spam and resource guards
+	AllowedGroupIDs  []int64 // Group chats allowed to use the bot (empty = none)
+	RateLimitPerHour int     // Downloads per user per hour (0 = unlimited)
+	MaxQueueSize     int     // Reject new jobs beyond this queue depth (0 = no cap)
+	MinFreeTmpfsMB   int     // Stop downloading when tmpfs has less free space
+	PlaylistMaxItems int     // Cap on YouTube playlist length (0 = no cap)
 }
 
 func Load() (*Config, error) {
@@ -43,15 +50,15 @@ func Load() (*Config, error) {
 	godotenv.Load(envPath)
 
 	cfg := &Config{
-		BotToken:    getEnv("BOT_TOKEN", ""),
-		RedisAddr:   getEnv("REDIS_ADDR", "localhost:6379"),
+		BotToken:  getEnv("BOT_TOKEN", ""),
+		RedisAddr: getEnv("REDIS_ADDR", "localhost:6379"),
 		// One concurrent yt-dlp+ffmpeg pipeline is the safe ceiling on a
 		// 4 GB SBC: downloads land in tmpfs and merging peaks in the
 		// hundreds of MB. Raise only for audio-only workloads.
-		WorkerCount: getEnvInt("WORKER_COUNT", 1),
-		TmpfsPath:   getEnv("TMPFS_PATH", "/dev/shm/videos"),
-		MaxFileSize: int64(getEnvInt("MAX_FILE_SIZE_MB", 512)) * 1024 * 1024,
-		LocalAPIURL: getEnv("LOCAL_API_URL", "http://127.0.0.1:8089"),
+		WorkerCount:      getEnvInt("WORKER_COUNT", 1),
+		TmpfsPath:        getEnv("TMPFS_PATH", "/dev/shm/videos"),
+		MaxFileSize:      int64(getEnvInt("MAX_FILE_SIZE_MB", 512)) * 1024 * 1024,
+		LocalAPIURL:      getEnv("LOCAL_API_URL", "http://127.0.0.1:8089"),
 		DonorChatIDs:     parseChatIDs(getEnv("DONOR_CHAT_IDS", "")),
 		CookiesFile:      getEnv("COOKIES_FILE", ""),        // Deprecated: for backward compatibility
 		TikTokCookies:    getEnv("TIKTOK_COOKIES", ""),      // Path to TikTok cookies file
@@ -59,6 +66,12 @@ func Load() (*Config, error) {
 		YouTubeCookies:   getEnv("YOUTUBE_COOKIES", ""),     // Path to YouTube cookies file
 		MinFreeMemMB:     getEnvInt("MIN_FREE_MEM_MB", 256), // Minimum free memory in MB
 		AdminChatID:      getEnvInt64("ADMIN_CHAT_ID", 0),   // Telegram chat for service reminders
+
+		AllowedGroupIDs:  parseChatIDs(getEnv("ALLOWED_GROUP_IDS", "")),
+		RateLimitPerHour: getEnvInt("RATE_LIMIT_JOBS_PER_HOUR", 12),
+		MaxQueueSize:     getEnvInt("MAX_QUEUE_SIZE", 20),
+		MinFreeTmpfsMB:   getEnvInt("MIN_FREE_TMPFS_MB", 300),
+		PlaylistMaxItems: getEnvInt("PLAYLIST_MAX_ITEMS", 50),
 	}
 
 	// Validate required fields

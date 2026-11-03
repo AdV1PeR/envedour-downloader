@@ -3,6 +3,8 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,6 +22,8 @@ type Bot struct {
 	executor    *executor.Executor
 	workerPool  chan struct{}
 	preferences *PreferencesStore
+	limiter     *rateLimiter
+	dedup       *urlDedup
 }
 
 func NewBot(cfg *config.Config, q queue.Queue, exec *executor.Executor) (*Bot, error) {
@@ -56,6 +60,8 @@ func NewBot(cfg *config.Config, q queue.Queue, exec *executor.Executor) (*Bot, e
 		executor:    exec,
 		preferences: prefsStore,
 		workerPool:  make(chan struct{}, cfg.WorkerCount+2),
+		limiter:     newRateLimiter(),
+		dedup:       newURLDedup(5 * time.Minute),
 	}
 
 	return bot, nil
@@ -94,8 +100,17 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	msg := update.Message
 	chatID := msg.Chat.ID
 
-	// Check if user is donor
-	isDonor := b.isDonor(chatID)
+	// Group chats are opt-in via ALLOWED_GROUP_IDS: ignore everything from
+	// unlisted groups. Log the ID so the admin can copy it into .env.
+	if !msg.Chat.IsPrivate() && !b.isGroupAllowed(chatID) {
+		log.Printf("Ignoring message from non-whitelisted group chat %d (%s); add it to ALLOWED_GROUP_IDS to enable", chatID, msg.Chat.Title)
+		return
+	}
+
+	// Check if user is donor. In groups the chat is the group itself, so
+	// also credit the sender: the admin must not be throttled in their own
+	// groups.
+	isDonor := b.isDonor(chatID) || (msg.From != nil && b.isDonor(msg.From.ID))
 
 	switch {
 	case msg.IsCommand():
@@ -145,6 +160,7 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool) {
 func (b *Bot) handleURL(msg *tgbotapi.Message, isDonor bool) {
 	url := msg.Text
 	chatID := msg.Chat.ID
+	isGroup := !msg.Chat.IsPrivate()
 
 	// Validate URL - check if it's a valid URL format
 	// Also check for URL entities in case Telegram parsed it
@@ -160,15 +176,35 @@ func (b *Bot) handleURL(msg *tgbotapi.Message, isDonor bool) {
 		}
 		// If still not valid, reject
 		if !isValidURL(url) {
+			if isGroup {
+				// Staying quiet in groups: replying to every non-URL
+				// message the bot sees would be spam.
+				return
+			}
 			b.sendMessage(chatID, "Пожалуйста, отправьте валидную ссылку на видео.")
+			return
+		}
+	}
+
+	// Anti-spam gates. In groups the key is the sender, so one spammer
+	// cannot burn the whole group's quota. Donors (the admin) bypass limits.
+	senderID := chatID
+	if msg.From != nil {
+		senderID = msg.From.ID
+	}
+	if !isDonor {
+		if b.dedup.seen(senderID, url) {
+			b.sendMessage(chatID, "⏳ Эта ссылка уже скачивалась недавно. Подожди немного.")
+			return
+		}
+		if ok, wait := b.limiter.allow(senderID, b.config.RateLimitPerHour, time.Hour); !ok {
+			b.sendMessage(chatID, fmt.Sprintf("⚠️ Слишком много запросов. Следующее скачивание будет доступно через %d мин.", int(wait.Minutes())+1))
 			return
 		}
 	}
 
 	// Check if URL is from Instagram or TikTok - auto-download best quality
 	if isInstagramURL(url) || isTikTokURL(url) {
-		// For Instagram/TikTok always use video (not audio)
-		// Create job with best quality automatically
 		job := &queue.Job{
 			ID:        generateJobID(),
 			URL:       url,
@@ -183,22 +219,17 @@ func (b *Bot) handleURL(msg *tgbotapi.Message, isDonor bool) {
 			job.Priority = queue.PriorityHigh
 		}
 
-		// Add to queue
-		if err := b.queue.Enqueue(job); err != nil {
-			b.sendMessage(chatID, "Ошибка при добавлении задачи в очередь. Попробуйте позже.")
-			return
+		if err := b.enqueueJob(job); err != nil {
+			b.sendMessage(chatID, err.Error())
 		}
-
 		return
 	}
 
-	// For other platforms (YouTube, etc.) - show quality selection keyboard
-	// Generate a temporary job ID for this URL
 	jobID := generateJobID()
+	isPlaylist := isYouTubePlaylistURL(url)
 
-	// Save URL temporarily in Redis (will be retrieved when user selects quality)
 	if b.preferences != nil {
-		if err := b.preferences.SavePendingURL(jobID, url); err != nil {
+		if err := b.preferences.SavePending(jobID, &PendingDownload{URL: url, IsPlaylist: isPlaylist}); err != nil {
 			b.sendMessage(chatID, "❌ Ошибка при обработке ссылки. Попробуйте позже.")
 			return
 		}
@@ -206,6 +237,9 @@ func (b *Bot) handleURL(msg *tgbotapi.Message, isDonor bool) {
 
 	// Show quality selection keyboard
 	text := "📥 Выбери качество для скачивания:"
+	if isPlaylist {
+		text = "📋 Найден плейлист. Выбери качество для всех видео:"
+	}
 	keyboard := createDownloadQualityKeyboard(jobID)
 	message := tgbotapi.NewMessage(chatID, text)
 	message.ReplyMarkup = &keyboard
@@ -245,6 +279,48 @@ func isInstagramURL(url string) bool {
 
 func isTikTokURL(url string) bool {
 	return strings.Contains(url, "tiktok.com") || strings.Contains(url, "vt.tiktok.com")
+}
+
+// isGroupAllowed reports whether the bot accepts messages from this group
+// chat. Private chats are always allowed; groups must be whitelisted via
+// ALLOWED_GROUP_IDS.
+func (b *Bot) isGroupAllowed(chatID int64) bool {
+	for _, id := range b.config.AllowedGroupIDs {
+		if id == chatID {
+			return true
+		}
+	}
+	return false
+}
+
+// isYouTubePlaylistURL reports whether the link points at a YouTube playlist
+// itself (youtube.com/playlist?list=...). Links to a single video that merely
+// carry a list= parameter are treated as single videos.
+func isYouTubePlaylistURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host != "youtube.com" && host != "www.youtube.com" && host != "music.youtube.com" {
+		return false
+	}
+	if strings.TrimSuffix(parsed.Path, "/") != "/playlist" {
+		return false
+	}
+	return parsed.Query().Get("list") != ""
+}
+
+// enqueueJob applies the queue-depth cap and enqueues the job. The returned
+// error carries a user-facing message.
+func (b *Bot) enqueueJob(job *queue.Job) error {
+	if b.config.MaxQueueSize > 0 && b.queue.GetStatus() >= b.config.MaxQueueSize {
+		return fmt.Errorf("⚠️ Очередь переполнена, попробуйте позже")
+	}
+	if err := b.queue.Enqueue(job); err != nil {
+		return fmt.Errorf("Ошибка при добавлении задачи в очередь. Попробуйте позже")
+	}
+	return nil
 }
 
 func generateJobID() string {
@@ -352,21 +428,15 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		qualityPart := strings.TrimPrefix(parts[0], "dl_q_")
 		jobID := parts[1]
 
-		// Retrieve URL from Redis
+		// Retrieve the staged download state from Redis
 		if b.preferences == nil {
 			b.sendMessage(chatID, "❌ Система недоступна. Попробуйте отправить ссылку снова.")
 			return
 		}
 
-		url, err := b.preferences.GetPendingURL(jobID)
-		if err != nil {
+		pending, err := b.preferences.GetPending(jobID, false)
+		if err != nil || !isValidURL(pending.URL) {
 			b.sendMessage(chatID, "❌ Ссылка устарела или не найдена. Пожалуйста, отправьте ссылку снова.")
-			return
-		}
-
-		// Validate URL
-		if !isValidURL(url) {
-			b.sendMessage(chatID, "❌ Неверная ссылка")
 			return
 		}
 
@@ -385,10 +455,26 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			}
 		}
 
+		// Playlists take a second step: the user picks the delivery mode.
+		if pending.IsPlaylist {
+			pending.Quality = qualityPart
+			pending.MediaType = mediaType
+			if err := b.preferences.SavePending(jobID, pending); err != nil {
+				b.sendMessage(chatID, "❌ Ошибка при обработке ссылки. Попробуйте позже.")
+				return
+			}
+			text := fmt.Sprintf("📋 Плейлист готов к скачиванию (%s).\nКак доставить видео?", qualityPart)
+			keyboard := createPlaylistDeliveryKeyboard(jobID)
+			msg := tgbotapi.NewEditMessageText(chatID, query.Message.MessageID, text)
+			msg.ReplyMarkup = &keyboard
+			b.api.Send(msg)
+			return
+		}
+
 		// Create job
 		job := &queue.Job{
 			ID:        generateJobID(),
-			URL:       url,
+			URL:       pending.URL,
 			ChatID:    chatID,
 			Priority:  queue.PriorityLow,
 			Quality:   qualityPart,
@@ -401,8 +487,70 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		}
 
 		// Add to queue
-		if err := b.queue.Enqueue(job); err != nil {
-			b.sendMessage(chatID, "❌ Ошибка при добавлении задачи в очередь. Попробуйте позже.")
+		if err := b.enqueueJob(job); err != nil {
+			b.sendMessage(chatID, err.Error())
+			return
+		}
+
+		// The staged state has been consumed.
+		b.preferences.DeletePending(jobID)
+
+		// Delete the keyboard message
+		deleteMsg := tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID)
+		b.api.Send(deleteMsg)
+
+	case strings.HasPrefix(data, "pl_"):
+		// Format: pl_<mode>:<jobID>, mode: seq | zip
+		parts := strings.SplitN(data, ":", 2)
+		if len(parts) != 2 {
+			b.sendMessage(chatID, "❌ Ошибка: неверный формат запроса")
+			return
+		}
+		mode := strings.TrimPrefix(parts[0], "pl_")
+		jobID := parts[1]
+
+		if b.preferences == nil {
+			b.sendMessage(chatID, "❌ Система недоступна. Попробуйте отправить ссылку снова.")
+			return
+		}
+
+		pending, err := b.preferences.GetPending(jobID, true)
+		if err != nil || !pending.IsPlaylist || !isValidURL(pending.URL) {
+			b.sendMessage(chatID, "❌ Ссылка устарела или не найдена. Пожалуйста, отправьте ссылку снова.")
+			return
+		}
+
+		delivery := "sequential"
+		if mode == "zip" {
+			delivery = "zip"
+		}
+		quality := pending.Quality
+		if quality == "" {
+			quality = "best"
+		}
+		mediaType := pending.MediaType
+		if mediaType == "" {
+			mediaType = "video"
+		}
+
+		job := &queue.Job{
+			ID:         generateJobID(),
+			URL:        pending.URL,
+			ChatID:     chatID,
+			Priority:   queue.PriorityLow,
+			Quality:    quality,
+			MediaType:  mediaType,
+			CreatedAt:  time.Now(),
+			IsPlaylist: true,
+			Delivery:   delivery,
+		}
+
+		if b.isDonor(chatID) {
+			job.Priority = queue.PriorityHigh
+		}
+
+		if err := b.enqueueJob(job); err != nil {
+			b.sendMessage(chatID, err.Error())
 			return
 		}
 
