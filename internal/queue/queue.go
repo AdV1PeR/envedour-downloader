@@ -27,6 +27,7 @@ type Job struct {
 
 	IsPlaylist bool   `json:"is_playlist,omitempty"` // URL is a whole YouTube playlist
 	Delivery   string `json:"delivery,omitempty"`    // playlists: "sequential" or "zip"
+	ResumeFrom int    `json:"resume_from,omitempty"` // playlists: skip items before this index (crash recovery)
 }
 
 type Queue interface {

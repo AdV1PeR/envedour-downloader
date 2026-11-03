@@ -18,6 +18,8 @@ Environment="GOMEMLIMIT=512MiB"
 ExecStart=/opt/envedour-bot/envedour-bot-arm64 --arm-optimized
 Restart=on-failure
 RestartSec=5s
+# The bot drains current downloads for up to 30s on SIGTERM; allow a margin.
+TimeoutStopSec=45s
 MemoryHigh=1.2G
 MemoryMax=1.5G
 CPUQuota=380%

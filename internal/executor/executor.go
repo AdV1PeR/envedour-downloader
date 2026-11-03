@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"envedour-bot/internal/queue"
 
 	tgbotapi "github.com/OvyFlash/telegram-bot-api"
+	"github.com/go-redis/redis/v8"
 )
 
 // ThermalMonitor interface for thermal monitoring (only on ARM64)
@@ -43,9 +45,16 @@ type Executor struct {
 	armOptimized bool
 	botAPI       *tgbotapi.BotAPI
 	thermalMon   ThermalMonitor
+	redis        *redis.Client
 
 	notifyMu         sync.Mutex
 	lastCookieNotify map[string]time.Time
+}
+
+// SetRedisClient wires the queue's Redis client so the executor can track
+// in-flight jobs for crash recovery.
+func (e *Executor) SetRedisClient(client *redis.Client) {
+	e.redis = client
 }
 
 func NewExecutor(cfg *config.Config, armOptimized bool) *Executor {
@@ -99,34 +108,164 @@ const (
 	playlistJobTimeout = 2 * time.Hour
 )
 
-func (e *Executor) Worker(ctx context.Context, q queue.Queue) {
+// inflight:jobs is a Redis hash tracking jobs currently being processed.
+// BRPop removes a job from the queue the moment a worker takes it, so
+// without this registry a crash (or a forced shutdown past the grace
+// period) would silently swallow the user's request.
+const inflightKey = "inflight:jobs"
+
+// inflightRecord is the value stored per job ID in the inflight hash.
+type inflightRecord struct {
+	Job  queue.Job `json:"job"`
+	Done int       `json:"done"` // completed playlist items (crash resume point)
+}
+
+func (e *Executor) markInflight(job *queue.Job) {
+	e.setInflight(inflightRecord{Job: *job})
+}
+
+// updateInflightProgress records how many playlist items are already
+// delivered so a crash resumes after them instead of re-sending.
+func (e *Executor) updateInflightProgress(job *queue.Job, done int) {
+	e.setInflight(inflightRecord{Job: *job, Done: done})
+}
+
+func (e *Executor) setInflight(rec inflightRecord) {
+	client := e.redisClient()
+	if client == nil {
+		return
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	// Surviving a Redis outage here is not required: the queue lives in the
+	// same Redis, so if it is down nothing can be recovered anyway.
+	client.HSet(context.Background(), inflightKey, rec.Job.ID, data)
+}
+
+func (e *Executor) clearInflight(jobID string) {
+	if client := e.redisClient(); client != nil {
+		client.HDel(context.Background(), inflightKey, jobID)
+	}
+}
+
+// RecoverInflight re-enqueues jobs that were in flight when the previous
+// process died. Called once at startup, before any worker starts. Returns
+// the number of recovered jobs. Sequential playlist jobs resume after the
+// items already delivered (at-least-once: a crash between a successful send
+// and the cleanup may still deliver one file twice).
+func (e *Executor) RecoverInflight(q queue.Queue) int {
+	client := q.GetClient()
+	if client == nil {
+		return 0
+	}
+	records, err := client.HGetAll(context.Background(), inflightKey).Result()
+	if err != nil {
+		log.Printf("Inflight recovery failed: %v", err)
+		return 0
+	}
+	if len(records) == 0 {
+		return 0
+	}
+
+	recovered := 0
+	for jobID, data := range records {
+		var rec inflightRecord
+		if err := json.Unmarshal([]byte(data), &rec); err != nil {
+			log.Printf("Inflight record %s is corrupt, dropping: %v", jobID, err)
+			client.HDel(context.Background(), inflightKey, jobID)
+			continue
+		}
+		job := rec.Job
+		job.ResumeFrom = rec.Done
+		if err := q.Enqueue(&job); err != nil {
+			log.Printf("Could not re-enqueue inflight job %s: %v", job.ID, err)
+			continue
+		}
+		client.HDel(context.Background(), inflightKey, job.ID)
+		recovered++
+		e.sendMessage(job.ChatID, "🔄 Бот перезапускался — задача восстановлена, продолжаю.")
+	}
+
+	if recovered > 0 {
+		log.Printf("Recovered %d in-flight job(s) from the previous run", recovered)
+		if e.config.AdminChatID != 0 {
+			e.sendMessage(e.config.AdminChatID, fmt.Sprintf("🔄 После перезапуска восстановлено задач: %d", recovered))
+		}
+	}
+	return recovered
+}
+
+// redisClient returns the shared Redis client if the executor was wired to
+// the queue's client, nil otherwise.
+func (e *Executor) redisClient() *redis.Client {
+	return e.redis
+}
+
+// Worker consumes jobs until the context is cancelled or the drain channel
+// closes (graceful shutdown: finish the current job, take no new ones).
+func (e *Executor) Worker(ctx context.Context, q queue.Queue, drain <-chan struct{}) {
+	backoff := time.Second
 	for {
 		select {
+		case <-drain:
+			return
 		case <-ctx.Done():
 			return
 		default:
-			job, err := q.Dequeue(ctx)
-			if err != nil {
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			if job == nil {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-
-			// A playlist downloads dozens of videos one by one: it needs a
-			// much longer budget than a single file.
-			timeout := jobTimeout
-			if job.IsPlaylist {
-				timeout = playlistJobTimeout
-			}
-			jobCtx, cancel := context.WithTimeout(ctx, timeout)
-			e.processJob(jobCtx, job)
-			cancel()
 		}
+
+		job, err := q.Dequeue(ctx)
+		if err != nil {
+			// Redis down / network blip: retry with a growing pause instead
+			// of silently spinning every second.
+			log.Printf("Dequeue error (retrying in %v): %v", backoff, err)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+
+		if job == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		backoff = time.Second
+
+		// A playlist downloads dozens of videos one by one: it needs a
+		// much longer budget than a single file.
+		timeout := jobTimeout
+		if job.IsPlaylist {
+			timeout = playlistJobTimeout
+		}
+		jobCtx, cancel := context.WithTimeout(ctx, timeout)
+
+		e.markInflight(job)
+		e.processJobSafe(jobCtx, job, func() {
+			e.processJob(jobCtx, job)
+		})
+		// Keep the inflight record when the job was interrupted (shutdown
+		// grace exceeded or yt-dlp wedged past the timeout): the next start
+		// re-enqueues it. Only finished jobs are cleared.
+		if jobCtx.Err() == nil {
+			e.clearInflight(job.ID)
+		}
+		cancel()
 	}
+}
+
+// processJobSafe runs one job with panic isolation: a bug in a handler must
+// kill the job, not the whole bot.
+func (e *Executor) processJobSafe(ctx context.Context, job *queue.Job, run func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC while processing job %s: %v\n%s", job.ID, r, debug.Stack())
+			e.sendMessage(job.ChatID, "❌ Внутренняя ошибка при обработке задачи. Попробуйте позже.")
+		}
+	}()
+	run()
 }
 
 // jobIDRe matches IDs the bot generates: job_<unixnano>, plus the _NNN item
@@ -338,13 +477,30 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		entries = entries[:e.config.PlaylistMaxItems]
 		truncatedNote = fmt.Sprintf("\n⚠️ В плейлисте %d видео — беру первые %d.", total, len(entries))
 	}
+
+	// Crash recovery: sequential deliveries skip the items already delivered
+	// before the restart. ZIP archives are rebuilt from scratch — a
+	// half-written archive does not survive the job cleanup.
+	resumeFrom := 0
+	if job.Delivery != "zip" && job.ResumeFrom > 0 {
+		if job.ResumeFrom >= len(entries) {
+			e.sendMessage(job.ChatID, "✅ Все видео этого плейлиста уже были отправлены до перезапуска.")
+			return
+		}
+		resumeFrom = job.ResumeFrom
+		entries = entries[resumeFrom:]
+	}
 	count := len(entries)
 
 	label := playlistTitle
 	if label == "" {
 		label = "Плейлист"
 	}
-	statusID := e.sendStatusMessage(job.ChatID, fmt.Sprintf("📋 «%s»: %d видео%s\n⏳ Скачиваю 1/%d…", label, count, truncatedNote, count))
+	statusText := fmt.Sprintf("📋 «%s»: %d видео%s\n⏳ Скачиваю 1/%d…", label, count, truncatedNote, count)
+	if resumeFrom > 0 {
+		statusText = fmt.Sprintf("🔄 «%s»: продолжаю с %d-го видео (осталось %d)%s", label, resumeFrom+1, count, truncatedNote)
+	}
+	statusID := e.sendStatusMessage(job.ChatID, statusText)
 
 	// In zip mode the archive lives in tmpfs too; it is cleaned up no matter
 	// how the job ends.
@@ -365,6 +521,10 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 
 	sent, failures := 0, 0
 	for i, entry := range entries {
+		// pos is the item's 1-based position in the whole playlist: item IDs,
+		// archive entry numbering and the crash-resume point all use it.
+		pos := resumeFrom + i + 1
+
 		// RAM guard: stop before tmpfs runs out instead of failing mid-download.
 		if err := e.checkTmpfsFree(); err != nil {
 			log.Printf("Playlist %s stopped: %v", job.ID, err)
@@ -372,12 +532,12 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 			return
 		}
 
-		e.editStatus(job.ChatID, statusID, fmt.Sprintf("⏳ Скачиваю %d/%d: %s", i+1, count, truncForStatus(entry.Title, 60)))
+		e.editStatus(job.ChatID, statusID, fmt.Sprintf("⏳ Скачиваю %d/%d: %s", pos, resumeFrom+count, truncForStatus(entry.Title, 60)))
 
-		itemID := fmt.Sprintf("%s_%03d", job.ID, i+1)
+		itemID := fmt.Sprintf("%s_%03d", job.ID, pos)
 		media, err := e.downloadMedia(ctx, entry.URL, itemID, quality, mediaType)
 		if err != nil {
-			log.Printf("Playlist item %d error: %v", i+1, err)
+			log.Printf("Playlist item %d error: %v", pos, err)
 			failures++
 			continue
 		}
@@ -387,17 +547,18 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 			if title == "" {
 				title = entry.Title
 			}
-			err = e.appendMediaToZip(zipWriter, media.path, title, i+1)
+			err = e.appendMediaToZip(zipWriter, media.path, title, pos)
 			os.Remove(media.path)
 			if media.thumb != "" {
 				os.Remove(media.thumb)
 			}
 			if err != nil {
-				log.Printf("Playlist item %d zip error: %v", i+1, err)
+				log.Printf("Playlist item %d zip error: %v", pos, err)
 				failures++
 				continue
 			}
 			sent++
+			e.updateInflightProgress(job, pos)
 			continue
 		}
 
@@ -412,11 +573,12 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 			os.Remove(media.thumb)
 		}
 		if err != nil {
-			log.Printf("Playlist item %d send error: %v", i+1, err)
+			log.Printf("Playlist item %d send error: %v", pos, err)
 			failures++
 			continue
 		}
 		sent++
+		e.updateInflightProgress(job, pos)
 	}
 
 	if sent == 0 {
@@ -522,6 +684,19 @@ func (e *Executor) finishPlaylistStatus(chatID int64, messageID int, text string
 	e.editStatus(chatID, messageID, text)
 }
 
+// sendWithRetry performs one automatic retry after a short pause: upload
+// blips happen, and a retry is far cheaper than re-downloading the file via
+// the crash-recovery path.
+func (e *Executor) sendWithRetry(c tgbotapi.Chattable) error {
+	_, err := e.botAPI.Send(c)
+	if err != nil {
+		log.Printf("Send failed (%v), retrying once", err)
+		time.Sleep(3 * time.Second)
+		_, err = e.botAPI.Send(c)
+	}
+	return err
+}
+
 // sendDocument uploads a file as a Telegram document with a caption.
 func (e *Executor) sendDocument(chatID int64, path, caption string) error {
 	if e.botAPI == nil {
@@ -544,7 +719,7 @@ func (e *Executor) sendDocument(chatID int64, path, caption string) error {
 
 	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(path))
 	doc.Caption = caption
-	if _, err := e.botAPI.Send(doc); err != nil {
+	if err := e.sendWithRetry(doc); err != nil {
 		return fmt.Errorf("failed to send document: %w", err)
 	}
 	return nil
@@ -1264,7 +1439,7 @@ func (e *Executor) sendAudio(chatID int64, audioPath, thumbPath, title string, d
 	}
 	audio.Duration = duration
 
-	_, err = e.botAPI.Send(audio)
+	err = e.sendWithRetry(audio)
 	if err != nil {
 		return fmt.Errorf("failed to send audio: %w", err)
 	}
@@ -1306,14 +1481,14 @@ func (e *Executor) sendVideo(chatID int64, videoPath string) error {
 		defer os.Remove(meta.thumb)
 	}
 	video.SupportsStreaming = true
-	if _, err := e.botAPI.Send(video); err == nil {
+	if err := e.sendWithRetry(video); err == nil {
 		return nil
 	} else {
 		log.Printf("Sending as video failed (%v), falling back to a document", err)
 	}
 
 	document := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(videoPath))
-	if _, err := e.botAPI.Send(document); err != nil {
+	if err := e.sendWithRetry(document); err != nil {
 		return fmt.Errorf("failed to send video: %w", err)
 	}
 	return nil

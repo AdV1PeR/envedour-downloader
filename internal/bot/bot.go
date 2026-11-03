@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -84,8 +85,20 @@ func (b *Bot) Start(ctx context.Context) {
 	}
 }
 
+// Stop stops the library's update-polling goroutines during shutdown.
+func (b *Bot) Stop() {
+	b.api.StopReceivingUpdates()
+}
+
 func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	defer func() { <-b.workerPool }() // Release worker
+	defer func() {
+		// A panic in an update handler must not kill the whole process:
+		// log it and move on to the next update.
+		if r := recover(); r != nil {
+			log.Printf("PANIC while handling an update: %v\n%s", r, debug.Stack())
+		}
+	}()
 
 	// Handle callback queries (button presses)
 	if update.CallbackQuery != nil {

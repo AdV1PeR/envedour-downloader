@@ -3,6 +3,7 @@ package executor
 import (
 	"archive/zip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"envedour-bot/internal/config"
+	"envedour-bot/internal/queue"
 )
 
 const fakeYTDLPHelp = `#!/bin/sh
@@ -511,5 +513,52 @@ func TestCheckTmpfsFree(t *testing.T) {
 	e.config.MinFreeTmpfsMB = 1 << 40
 	if err := e.checkTmpfsFree(); err == nil {
 		t.Fatal("expected an error with an impossible free-space requirement")
+	}
+}
+
+func TestInflightRecordRoundTrip(t *testing.T) {
+	rec := inflightRecord{
+		Job: queue.Job{
+			ID:         "job_123",
+			URL:        "https://www.youtube.com/playlist?list=PLabc",
+			ChatID:     -100123,
+			Quality:    "720p",
+			MediaType:  "video",
+			IsPlaylist: true,
+			Delivery:   "sequential",
+		},
+		Done: 17,
+	}
+
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back inflightRecord
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Job.ID != rec.Job.ID || back.Job.ChatID != rec.Job.ChatID ||
+		back.Job.IsPlaylist != rec.Job.IsPlaylist || back.Job.Delivery != rec.Job.Delivery || back.Done != 17 {
+		t.Fatalf("round trip mismatch: %+v vs %+v", back, rec)
+	}
+}
+
+func TestProcessJobSafe(t *testing.T) {
+	e := &Executor{config: &config.Config{}} // nil botAPI: sendMessage is a no-op
+
+	// A panicking job must be contained: no panic escapes, the user is told
+	// about the internal error.
+	e.processJobSafe(context.Background(), &queue.Job{ID: "job_1", ChatID: 1}, func() {
+		panic("boom")
+	})
+
+	// A normal job runs to completion.
+	ran := false
+	e.processJobSafe(context.Background(), &queue.Job{ID: "job_2", ChatID: 1}, func() {
+		ran = true
+	})
+	if !ran {
+		t.Fatal("normal job must run")
 	}
 }
