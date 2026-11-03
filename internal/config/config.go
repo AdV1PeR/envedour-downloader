@@ -23,6 +23,7 @@ type Config struct {
 	InstagramCookies string // Path to Instagram cookies file (Netscape format)
 	YouTubeCookies   string // Path to YouTube cookies file (Netscape format)
 	MinFreeMemMB     int    // Minimum free memory in MB (default: 256)
+	AdminChatID      int64  // Telegram chat for service reminders (0 = disabled)
 }
 
 func Load() (*Config, error) {
@@ -42,18 +43,22 @@ func Load() (*Config, error) {
 	godotenv.Load(envPath)
 
 	cfg := &Config{
-		BotToken:         getEnv("BOT_TOKEN", ""),
-		RedisAddr:        getEnv("REDIS_ADDR", "localhost:6379"),
-		WorkerCount:      getEnvInt("WORKER_COUNT", 4),
-		TmpfsPath:        getEnv("TMPFS_PATH", "/dev/shm/videos"),
-		MaxFileSize:      int64(getEnvInt("MAX_FILE_SIZE_MB", 2048)) * 1024 * 1024,
-		LocalAPIURL:      getEnv("LOCAL_API_URL", "http://localhost:8089"),
+		BotToken:    getEnv("BOT_TOKEN", ""),
+		RedisAddr:   getEnv("REDIS_ADDR", "localhost:6379"),
+		// One concurrent yt-dlp+ffmpeg pipeline is the safe ceiling on a
+		// 4 GB SBC: downloads land in tmpfs and merging peaks in the
+		// hundreds of MB. Raise only for audio-only workloads.
+		WorkerCount: getEnvInt("WORKER_COUNT", 1),
+		TmpfsPath:   getEnv("TMPFS_PATH", "/dev/shm/videos"),
+		MaxFileSize: int64(getEnvInt("MAX_FILE_SIZE_MB", 512)) * 1024 * 1024,
+		LocalAPIURL: getEnv("LOCAL_API_URL", "http://127.0.0.1:8089"),
 		DonorChatIDs:     parseChatIDs(getEnv("DONOR_CHAT_IDS", "")),
 		CookiesFile:      getEnv("COOKIES_FILE", ""),        // Deprecated: for backward compatibility
 		TikTokCookies:    getEnv("TIKTOK_COOKIES", ""),      // Path to TikTok cookies file
 		InstagramCookies: getEnv("INSTAGRAM_COOKIES", ""),   // Path to Instagram cookies file
 		YouTubeCookies:   getEnv("YOUTUBE_COOKIES", ""),     // Path to YouTube cookies file
 		MinFreeMemMB:     getEnvInt("MIN_FREE_MEM_MB", 256), // Minimum free memory in MB
+		AdminChatID:      getEnvInt64("ADMIN_CHAT_ID", 0),   // Telegram chat for service reminders
 	}
 
 	// Validate required fields
@@ -84,6 +89,15 @@ func getEnv(key, defaultValue string) string {
 func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvInt64(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.ParseInt(value, 10, 64); err == nil {
 			return intValue
 		}
 	}

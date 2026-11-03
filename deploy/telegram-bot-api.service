@@ -9,8 +9,10 @@ Type=exec
 User=botuser
 Group=botuser
 WorkingDirectory=/opt/telegram-bot-api
+# LOCAL_API_URL in the bot's .env must use the same port.
+Environment="TELEGRAM_HTTP_PORT=8089"
 EnvironmentFile=/opt/telegram-bot-api/.env
-ExecStart=/usr/local/bin/telegram-bot-api --local --http-port=8089 --dir=/opt/telegram-bot-api/data
+ExecStart=/usr/local/bin/telegram-bot-api --local --http-port=${TELEGRAM_HTTP_PORT} --dir=/opt/telegram-bot-api/data
 Restart=on-failure
 RestartSec=5s
 MemoryHigh=512M

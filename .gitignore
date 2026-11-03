@@ -43,3 +43,10 @@ Thumbs.db
 # Temporary files
 /tmp/
 /dev/shm/videos/
+
+# --- fleet hygiene (2026-11-03) ---
+cookies_*.txt
+opt/
+GITHUB_PUSH.md
+prompt*.txt
+.zcode/

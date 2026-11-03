@@ -1,0 +1,16 @@
+# Dedicated tmpfs with a hard size quota for envedour-downloader.
+# A tmpfs size limit turns RAM exhaustion into ENOSPC (a clean error the bot
+# reports to the user) instead of triggering the kernel OOM killer.
+# Install with:
+#   sudo cp deploy/envedour-videos.tmpfs /etc/systemd/system/envedour-videos.mount
+#   sudo mkdir -p /dev/shm/videos && sudo systemctl daemon-reload
+#   sudo systemctl enable --now envedour-videos.mount
+[Unit]
+Description=Quoted tmpfs for envedour-downloader video jobs
+What=tmpfs
+Where=/dev/shm/videos
+Type=tmpfs
+Options=size=768m,mode=0755,uid=botuser,gid=botuser
+
+[Install]
+WantedBy=local-fs.target

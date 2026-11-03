@@ -1,8 +1,8 @@
 [Unit]
 Description=Envedour Down Bot (ARM Optimized)
-After=network.target redis.service telegram-bot-api.service
+After=network-online.target redis.service telegram-bot-api.service
+Wants=network-online.target telegram-bot-api.service
 Requires=redis.service
-Wants=telegram-bot-api.service
 StartLimitIntervalSec=500
 StartLimitBurst=5
 
@@ -18,12 +18,11 @@ Environment="GOMEMLIMIT=512MiB"
 ExecStart=/opt/envedour-bot/envedour-bot-arm64 --arm-optimized
 Restart=on-failure
 RestartSec=5s
-MemoryHigh=3.5G
-MemoryMax=4G
+MemoryHigh=1.2G
+MemoryMax=1.5G
 CPUQuota=380%
 IOWeight=100
 Nice=-10
-RuntimeWatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target

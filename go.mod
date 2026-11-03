@@ -1,10 +1,10 @@
 module envedour-bot
 
-go 1.22
+go 1.23
 
 require (
+	github.com/OvyFlash/telegram-bot-api v0.0.0-20260826195316-83c4eada97a1
 	github.com/go-redis/redis/v8 v8.11.5
-	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
 	github.com/joho/godotenv v1.5.1
 )
 
