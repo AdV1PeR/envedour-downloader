@@ -57,8 +57,9 @@ type Executor struct {
 
 // activeJob pairs a running job with the context cancel that kills it.
 type activeJob struct {
-	job    *queue.Job
-	cancel context.CancelFunc
+	job      *queue.Job
+	cancel   context.CancelFunc
+	progress string // short status line for the live /status view
 }
 
 // SetRedisClient wires the queue's Redis client so the executor can track
@@ -104,6 +105,46 @@ func (e *Executor) CancelByUser(userID int64) []string {
 		stopped = append(stopped, truncForStatus(a.job.URL, 60))
 	}
 	return stopped
+}
+
+// ActiveContainsURL reports whether a job with this exact URL is currently
+// running (duplicate-request guard).
+func (e *Executor) ActiveContainsURL(url string) bool {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	for _, a := range e.active {
+		if a.job.URL == url {
+			return true
+		}
+	}
+	return false
+}
+
+// setJobProgress stores a short progress line shown by /status.
+func (e *Executor) setJobProgress(jobID, text string) {
+	e.cancelMu.Lock()
+	if a, ok := e.active[jobID]; ok {
+		a.progress = text
+	}
+	e.cancelMu.Unlock()
+}
+
+// ActiveStatus returns one line per running job for the live /status view.
+func (e *Executor) ActiveStatus() []string {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	lines := make([]string, 0, len(e.active))
+	for _, a := range e.active {
+		line := "• " + truncForStatus(a.job.URL, 50)
+		if a.job.IsPlaylist {
+			line = "• плейлист " + truncForStatus(a.job.URL, 45)
+		}
+		if a.progress != "" {
+			line += " — " + a.progress
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 func NewExecutor(cfg *config.Config, armOptimized bool) *Executor {
@@ -369,6 +410,8 @@ func (e *Executor) processJob(ctx context.Context, job *queue.Job) {
 		return
 	}
 
+	e.setJobProgress(job.ID, "скачивается")
+
 	// Set default values if not set
 	quality := job.Quality
 	if quality == "" {
@@ -481,6 +524,85 @@ func (e *Executor) cleanupStaleArchives(jobID string) {
 			os.Remove(filepath.Join(e.config.ArchiveDir, entry.Name()))
 		}
 	}
+}
+
+// reasonTranslations maps common yt-dlp failure phrases to short Russian
+// explanations for playlist error reports.
+var reasonTranslations = [...]struct{ match, text string }{
+	{"rate-limit reached or login required", "требуется вход или лимит запросов — нужны свежие куки"},
+	{"sign in to confirm", "требуется вход (подтверждение возраста)"},
+	{"video unavailable", "видео недоступно"},
+	{"private video", "приватное видео"},
+	{"http error 404", "не найдено (404)"},
+	{"http error 403", "доступ запрещён (403)"},
+}
+
+// shortReason distills a download error into one short user-facing line:
+// yt-dlp's stderr is chatty, and the meaningful part is its last ERROR line.
+// Known phrases are replaced with plain Russian explanations.
+func shortReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	lowered := strings.ToLower(err.Error())
+	for _, t := range reasonTranslations {
+		if strings.Contains(lowered, t.match) {
+			return t.text
+		}
+	}
+	reason := ""
+	for _, line := range strings.Split(err.Error(), "\n") {
+		if idx := strings.Index(line, "ERROR:"); idx >= 0 {
+			reason = strings.TrimSpace(line[idx+6:])
+		}
+	}
+	if reason == "" {
+		reason = strings.TrimSpace(strings.SplitN(err.Error(), "\n", 2)[0])
+	}
+	reason = strings.TrimPrefix(reason, "yt-dlp failed: ")
+	runes := []rune(reason)
+	if len(runes) > 100 {
+		reason = string(runes[:99]) + "…"
+	}
+	return reason
+}
+
+// failedItemsRecord stores the URLs of a playlist's failed items so the
+// "Повторить ошибки" button can re-download exactly those (24h TTL).
+type FailedItemsRecord struct {
+	URLs      []string `json:"urls"`
+	Quality   string   `json:"quality"`
+	MediaType string   `json:"media_type"`
+	Delivery  string   `json:"delivery"`
+}
+
+func (e *Executor) saveFailedItems(jobID string, rec FailedItemsRecord) {
+	if e.redis == nil || len(rec.URLs) == 0 {
+		return
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	e.redis.Set(context.Background(), "failed_items:"+jobID, data, 24*time.Hour)
+}
+
+// TakeFailedItems returns (and consumes) the stored failed-item list for a
+// finished playlist job.
+func (e *Executor) TakeFailedItems(jobID string) *FailedItemsRecord {
+	if e.redis == nil {
+		return nil
+	}
+	raw, err := e.redis.Get(context.Background(), "failed_items:"+jobID).Result()
+	if err != nil {
+		return nil
+	}
+	e.redis.Del(context.Background(), "failed_items:"+jobID)
+	var rec FailedItemsRecord
+	if json.Unmarshal([]byte(raw), &rec) != nil {
+		return nil
+	}
+	return &rec
 }
 
 // archiveBuilder assembles a multi-part ZIP on disk, sending and deleting
@@ -698,11 +820,23 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		mediaType = "video"
 	}
 
-	entries, playlistTitle, err := e.listPlaylist(ctx, job.URL)
-	if err != nil {
-		log.Printf("Playlist listing error: %v", err)
-		e.sendMessage(job.ChatID, "❌ Не удалось получить список видео из плейлиста.")
-		return
+	var entries []playlistEntry
+	var playlistTitle string
+	if len(job.Urls) > 0 {
+		// Explicit item list ("Повторить ошибки"): download exactly these
+		// videos instead of listing a playlist.
+		playlistTitle = "Повтор ошибок"
+		for i, u := range job.Urls {
+			entries = append(entries, playlistEntry{URL: u, Title: fmt.Sprintf("видео %d", i+1)})
+		}
+	} else {
+		var err error
+		entries, playlistTitle, err = e.listPlaylist(ctx, job.URL)
+		if err != nil {
+			log.Printf("Playlist listing error: %v", err)
+			e.sendMessage(job.ChatID, "❌ Не удалось получить список видео из плейлиста.")
+			return
+		}
 	}
 	total := len(entries)
 	if total == 0 {
@@ -710,9 +844,10 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		return
 	}
 
-	// Donors (the admin) have no item cap.
+	// Donors (the admin) have no item cap; explicit retry lists are already
+	// the exact filtered set.
 	truncatedNote := ""
-	if !job.FromDonor && e.config.PlaylistMaxItems > 0 && total > e.config.PlaylistMaxItems {
+	if !job.FromDonor && len(job.Urls) == 0 && e.config.PlaylistMaxItems > 0 && total > e.config.PlaylistMaxItems {
 		entries = entries[:e.config.PlaylistMaxItems]
 		truncatedNote = fmt.Sprintf("\n⚠️ В плейлисте %d видео — беру первые %d.", total, len(entries))
 	}
@@ -767,6 +902,8 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 
 	sent, failures := 0, 0
 	var skipNotes []string
+	var failedItems []string
+	var failedURLs []string
 	cancelled := false
 	for i, entry := range entries {
 		// /stop: stop taking new items; already delivered parts stay.
@@ -782,21 +919,42 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		// RAM guard: stop before tmpfs runs out instead of failing mid-download.
 		if err := e.checkTmpfsFree(); err != nil {
 			log.Printf("Playlist %s stopped: %v", job.ID, err)
-			e.finishPlaylistStatus(job.ChatID, statusID, fmt.Sprintf("💾 Остановлено: мало свободной памяти.\n✅ Успешно: %d из %d.", sent, count))
+			e.finishPlaylistStatus(job.ChatID, statusID, fmt.Sprintf("💾 Остановлено: мало свободной памяти.\n✅ Успешно: %d из %d.", sent, count), nil)
 			return
 		}
 
-		e.editStatus(job.ChatID, statusID, fmt.Sprintf("⏳ Скачиваю %d/%d: %s", pos, resumeFrom+count, truncForStatus(entry.Title, 60)))
+		progress := fmt.Sprintf("%d/%d: %s", pos, resumeFrom+count, truncForStatus(entry.Title, 45))
+		e.setJobProgress(job.ID, progress)
+		e.editStatus(job.ChatID, statusID, "⏳ Скачиваю "+progress)
 
 		itemID := fmt.Sprintf("%s_%03d", job.ID, pos)
-		media, err := e.downloadMedia(plexCtx, entry.URL, itemID, quality, mediaType)
+
+		// Download with one automatic retry: most playlist failures are
+		// transient (YouTube rate limiting), and a short pause recovers them.
+		var media mediaResult
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 {
+				time.Sleep(8 * time.Second)
+			}
+			media, err = e.downloadMedia(plexCtx, entry.URL, itemID, quality, mediaType)
+			if err == nil || e.isCancelled(job.ID) || plexCtx.Err() != nil {
+				break
+			}
+		}
 		if err != nil {
 			if e.isCancelled(job.ID) {
 				cancelled = true
 				break
 			}
-			log.Printf("Playlist item %d error: %v", pos, err)
+			reason := shortReason(err)
+			log.Printf("Playlist item %d (%s) failed: %s", pos, entry.Title, reason)
+			// Cookie problems show up for playlist items too; the admin
+			// reminder is internally throttled per platform.
+			e.notifyAdminCookiesStale(entry.URL, err)
 			failures++
+			failedItems = append(failedItems, fmt.Sprintf("видео %d — %s (%s)", pos, truncForStatus(entry.Title, 40), reason))
+			failedURLs = append(failedURLs, entry.URL)
 			continue
 		}
 
@@ -822,7 +980,7 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 				e.editStatus(job.ChatID, statusID, fmt.Sprintf("📦 Отправляю архив %d (видео %d–%d)…", arch.partNo, arch.firstPos, arch.lastPos))
 				if err := arch.sealAndSend(); err != nil {
 					log.Printf("Playlist part send error: %v", err)
-					e.finishPlaylistStatus(job.ChatID, statusID, "❌ Ошибка при отправке архива.")
+					e.finishPlaylistStatus(job.ChatID, statusID, "❌ Ошибка при отправке архива.", nil)
 					return
 				}
 			}
@@ -834,7 +992,7 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 					os.Remove(media.thumb)
 				}
 				log.Printf("Playlist %s stopped: %v", job.ID, err)
-				e.finishPlaylistStatus(job.ChatID, statusID, fmt.Sprintf("💾 Остановлено: мало места на диске.\n✅ Успешно: %d из %d.", sent, count))
+				e.finishPlaylistStatus(job.ChatID, statusID, fmt.Sprintf("💾 Остановлено: мало места на диске.\n✅ Успешно: %d из %d.", sent, count), nil)
 				return
 			}
 
@@ -851,6 +1009,8 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 				log.Printf("Playlist item %d zip error: %v", pos, err)
 				arch.discard()
 				failures++
+				failedItems = append(failedItems, fmt.Sprintf("видео %d — %s (ошибка упаковки)", pos, truncForStatus(title, 40)))
+				failedURLs = append(failedURLs, entry.URL)
 				continue
 			}
 			sent++
@@ -885,10 +1045,10 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 
 	if sent == 0 {
 		if cancelled {
-			e.finishPlaylistStatus(job.ChatID, statusID, "🛑 Остановлено по запросу — ни одно видео не было доставлено.")
+			e.finishPlaylistStatus(job.ChatID, statusID, "🛑 Остановлено по запросу — ни одно видео не было доставлено.", nil)
 			return
 		}
-		e.finishPlaylistStatus(job.ChatID, statusID, "❌ Не удалось скачать ни одно видео из плейлиста.")
+		e.finishPlaylistStatus(job.ChatID, statusID, "❌ Не удалось скачать ни одно видео из плейлиста.", nil)
 		return
 	}
 
@@ -896,7 +1056,7 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 		e.editStatus(job.ChatID, statusID, fmt.Sprintf("📦 Отправляю архив %d (видео %d–%d)…", arch.partNo, arch.firstPos, arch.lastPos))
 		if err := arch.sealAndSend(); err != nil {
 			log.Printf("Playlist part send error: %v", err)
-			e.finishPlaylistStatus(job.ChatID, statusID, "❌ Ошибка при отправке архива.")
+			e.finishPlaylistStatus(job.ChatID, statusID, "❌ Ошибка при отправке архива.", nil)
 			return
 		}
 	}
@@ -910,10 +1070,73 @@ func (e *Executor) processPlaylistJob(ctx context.Context, job *queue.Job) {
 	if failures > 0 {
 		summary += fmt.Sprintf(" (ошибок: %d)", failures)
 	}
+
+	// Offer a one-tap retry of exactly the failed videos (24h window).
+	var retryKeyboard *tgbotapi.InlineKeyboardMarkup
+	if len(failedItems) > 0 {
+		e.saveFailedItems(job.ID, FailedItemsRecord{
+			URLs:      failedURLs,
+			Quality:   quality,
+			MediaType: mediaType,
+			Delivery:  job.Delivery,
+		})
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData(
+					fmt.Sprintf("🔁 Повторить ошибки (%d)", len(failedItems)),
+					fmt.Sprintf("retry_err:%s", job.ID),
+				),
+			),
+		)
+		retryKeyboard = &kb
+	}
+
+	if len(failedItems) > 15 {
+		// Too many failures for one message: ship the full report (with
+		// links) as a text file.
+		if report, err := e.writeErrorReport(job.ID, label, sent, count, failures, failedItems, failedURLs); err == nil {
+			defer os.Remove(report)
+			if err := e.sendDocument(job.ChatID, report, "📄 Отчёт об ошибках"); err != nil {
+				log.Printf("Playlist error report send error: %v", err)
+			}
+			summary += fmt.Sprintf("\n\n❌ Не скачались (%d): полный отчёт — файлом.", len(failedItems))
+		} else {
+			log.Printf("Playlist error report write error: %v", err)
+			summary += fmt.Sprintf("\n\n❌ Не скачались (%d): полный список в журнале.", len(failedItems))
+		}
+	} else if len(failedItems) > 0 {
+		summary += fmt.Sprintf("\n\n❌ Не скачались (%d):", len(failedItems))
+		for _, item := range failedItems {
+			summary += "\n• " + item
+		}
+	}
 	for _, note := range skipNotes {
 		summary += "\n⚠️ " + note
 	}
-	e.finishPlaylistStatus(job.ChatID, statusID, summary)
+	e.finishPlaylistStatus(job.ChatID, statusID, summary, retryKeyboard)
+}
+
+// writeErrorReport writes the full failure list (with links) as a text file
+// for playlists whose error list does not fit into one message.
+func (e *Executor) writeErrorReport(jobID, label string, sent, count, failures int, failedItems, failedURLs []string) (string, error) {
+	if err := os.MkdirAll(e.config.ArchiveDir, 0700); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Отчёт об ошибках — «%s»\nДата: %s\nУспешно: %d из %d; ошибок: %d\n\n",
+		label, time.Now().Format("2006-01-02 15:04"), sent, count, failures))
+	for i, item := range failedItems {
+		url := ""
+		if i < len(failedURLs) {
+			url = failedURLs[i]
+		}
+		sb.WriteString(fmt.Sprintf("%d. %s\n   %s\n", i+1, item, url))
+	}
+	path := filepath.Join(e.config.ArchiveDir, jobID+".errors.txt")
+	if err := os.WriteFile(path, []byte(sb.String()), 0644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // appendMediaToZip copies a downloaded file into the playlist archive with
@@ -973,12 +1196,16 @@ func (e *Executor) editStatus(chatID int64, messageID int, text string) {
 
 // finishPlaylistStatus edits the progress message, falling back to a plain
 // message when the original status could not be sent.
-func (e *Executor) finishPlaylistStatus(chatID int64, messageID int, text string) {
+func (e *Executor) finishPlaylistStatus(chatID int64, messageID int, text string, markup *tgbotapi.InlineKeyboardMarkup) {
 	if messageID == 0 {
 		e.sendMessage(chatID, text)
 		return
 	}
-	e.editStatus(chatID, messageID, text)
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	if markup != nil {
+		edit.ReplyMarkup = markup
+	}
+	e.botAPI.Send(edit)
 }
 
 // sendWithRetry performs one automatic retry after a short pause: upload
@@ -1689,6 +1916,12 @@ func (e *Executor) getFormatForQuality(quality string) string {
 	switch quality {
 	case "1080p":
 		return "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+	case "1440p":
+		return "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best"
+	case "2160p":
+		return "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
+	case "4320p":
+		return "bestvideo[height<=4320]+bestaudio/best[height<=4320]/best"
 	case "720p":
 		return "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
 	case "480p":

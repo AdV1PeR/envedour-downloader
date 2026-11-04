@@ -241,6 +241,10 @@ func (b *Bot) handleURL(msg *tgbotapi.Message, isDonor bool) {
 		senderID = msg.From.ID
 	}
 	if !isDonor {
+		if b.isDuplicate(url, isDonor) {
+			b.sendMessage(chatID, "🚫 Эта ссылка уже скачивается или стоит в очереди.")
+			return
+		}
 		if b.dedup.seen(senderID, url) {
 			b.sendMessage(chatID, "⏳ Эта ссылка уже скачивалась недавно. Подожди немного.")
 			return
@@ -530,6 +534,12 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			senderID = query.From.ID
 		}
 
+		// Duplicate guard: the same link may already be running or queued.
+		if b.isDuplicate(pending.URL, isDonor) {
+			b.sendMessage(chatID, "🚫 Эта ссылка уже скачивается или стоит в очереди.")
+			return
+		}
+
 		// Create job
 		job := &queue.Job{
 			ID:        generateJobID(),
@@ -560,6 +570,49 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		deleteMsg := tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID)
 		b.api.Send(deleteMsg)
 
+	case strings.HasPrefix(data, "retry_err:"):
+		// One-tap retry of exactly the videos that failed in a finished
+		// playlist job. The stored list is single-use (24h TTL).
+		jobID := strings.TrimPrefix(data, "retry_err:")
+
+		rec := b.executor.TakeFailedItems(jobID)
+		if rec == nil || len(rec.URLs) == 0 {
+			b.sendMessage(chatID, "❌ Список ошибок устарел. Скачайте плейлист заново.")
+			return
+		}
+
+		isDonor := b.isDonor(chatID) || (query.From != nil && b.isDonor(query.From.ID))
+		var senderID int64
+		if query.From != nil {
+			senderID = query.From.ID
+		}
+
+		job := &queue.Job{
+			ID:         generateJobID(),
+			ChatID:     chatID,
+			Priority:   queue.PriorityLow,
+			Quality:    rec.Quality,
+			MediaType:  rec.MediaType,
+			CreatedAt:  time.Now(),
+			IsPlaylist: true,
+			Delivery:   rec.Delivery,
+			Urls:       rec.URLs,
+			FromID:     senderID,
+		}
+		if isDonor {
+			job.Priority = queue.PriorityHigh
+			job.FromDonor = true
+		}
+
+		if err := b.enqueueJob(job, isDonor); err != nil {
+			b.sendMessage(chatID, err.Error())
+			return
+		}
+
+		msg := tgbotapi.NewEditMessageText(chatID, query.Message.MessageID,
+			fmt.Sprintf("🔁 Перезапускаю %d видео из списка ошибок…", len(rec.URLs)))
+		b.api.Send(msg)
+
 	case strings.HasPrefix(data, "pl_"):
 		// Format: pl_<mode>:<jobID>, mode: seq | zip
 		parts := strings.SplitN(data, ":", 2)
@@ -575,7 +628,7 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			return
 		}
 
-		pending, err := b.preferences.GetPending(jobID, true)
+		pending, err := b.preferences.GetPending(jobID, false)
 		if err != nil || !pending.IsPlaylist || !isValidURL(pending.URL) {
 			b.sendMessage(chatID, "❌ Ссылка устарела или не найдена. Пожалуйста, отправьте ссылку снова.")
 			return
@@ -601,6 +654,13 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			senderID = query.From.ID
 		}
 
+		// Duplicate guard before consuming the staged state: a blocked
+		// request must not invalidate the keyboard.
+		if b.isDuplicate(pending.URL, isDonor) {
+			b.sendMessage(chatID, "🚫 Этот плейлист уже скачивается или стоит в очереди.")
+			return
+		}
+
 		job := &queue.Job{
 			ID:         generateJobID(),
 			URL:        pending.URL,
@@ -624,6 +684,9 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			return
 		}
 
+		// The staged state has been consumed.
+		b.preferences.DeletePending(jobID)
+
 		// Delete the keyboard message
 		deleteMsg := tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID)
 		b.api.Send(deleteMsg)
@@ -640,7 +703,24 @@ func (b *Bot) showStatus(chatID int64) {
 		prefs = &UserPreferences{Quality: "best", MediaType: "video"}
 	}
 	text := fmt.Sprintf("📊 Очередь: %d задач\n\n⚙️ Текущие настройки:\nКачество: %s\nТип: %s", status, prefs.Quality, prefs.MediaType)
+
+	// Live view: what is downloading right now.
+	if active := b.executor.ActiveStatus(); len(active) > 0 {
+		text += "\n\n🔄 Сейчас качается:"
+		for _, line := range active {
+			text += "\n" + line
+		}
+	} else {
+		text += "\n\n✅ Сейчас ничего не качается"
+	}
+
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = createMainKeyboard()
 	b.api.Send(msg)
+}
+
+// isDuplicate reports whether this exact URL is already running or queued.
+// Donors bypass the check: the admin may intentionally re-download.
+func (b *Bot) isDuplicate(url string, isDonor bool) bool {
+	return !isDonor && (b.executor.ActiveContainsURL(url) || b.queue.ContainsURL(url))
 }

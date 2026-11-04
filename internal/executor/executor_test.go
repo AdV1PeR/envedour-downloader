@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -678,5 +679,54 @@ func TestCancelByUser(t *testing.T) {
 	e.untrackJob("job_1")
 	if e.isCancelled("job_1") {
 		t.Fatal("cancelled flag must be cleared on untrack")
+	}
+}
+
+func TestShortReason(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			"rate limit",
+			fmt.Errorf("yt-dlp failed: exit status 1\nOutput: WARNING: [youtube] abc: nsig\nERROR: [youtube] abc: Requested content is not available, rate-limit reached or login required. Use --cookies"),
+			"требуется вход или лимит запросов — нужны свежие куки",
+		},
+		{
+			"unavailable",
+			fmt.Errorf("yt-dlp failed: exit status 1\nOutput: ERROR: [youtube] abc: Video unavailable"),
+			"видео недоступно",
+		},
+		{
+			"unknown error falls back to the last ERROR line",
+			fmt.Errorf("yt-dlp failed: exit status 1\nOutput: WARNING: something\nERROR: [generic] abc: Unsupported URL"),
+			"[generic] abc: Unsupported URL",
+		},
+		{
+			"no ERROR line falls back to the first line",
+			fmt.Errorf("context canceled"),
+			"context canceled",
+		},
+	}
+
+	for _, tt := range tests {
+		if got := shortReason(tt.err); got != tt.want {
+			t.Errorf("%s: shortReason = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestGetFormatForQualityHighRes(t *testing.T) {
+	for _, q := range []string{"1440p", "2160p", "4320p"} {
+		f := (&Executor{}).getFormatForQuality(q)
+		if !strings.Contains(f, "height<=") {
+			t.Errorf("%s selector missing height filter: %s", q, f)
+		}
+		// High-res sources are often webm/vp9: no container filter, so the
+		// best codec available is chosen and remuxed to mp4.
+		if strings.Contains(f, "ext=") {
+			t.Errorf("%s selector must not filter by container: %s", q, f)
+		}
 	}
 }

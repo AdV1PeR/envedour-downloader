@@ -62,6 +62,11 @@ func createDownloadQualityKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("1080p", fmt.Sprintf("dl_q_1080p:%s", jobID)),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("2K", fmt.Sprintf("dl_q_1440p:%s", jobID)),
+			tgbotapi.NewInlineKeyboardButtonData("4K", fmt.Sprintf("dl_q_2160p:%s", jobID)),
+			tgbotapi.NewInlineKeyboardButtonData("8K", fmt.Sprintf("dl_q_4320p:%s", jobID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("720p", fmt.Sprintf("dl_q_720p:%s", jobID)),
 			tgbotapi.NewInlineKeyboardButtonData("480p", fmt.Sprintf("dl_q_480p:%s", jobID)),
 		),
