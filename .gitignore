@@ -50,3 +50,5 @@ opt/
 GITHUB_PUSH.md
 prompt*.txt
 .zcode/
+.zcode/
+deploy-staging/

@@ -56,8 +56,9 @@ func Load() (*Config, error) {
 	godotenv.Load(envPath)
 
 	cfg := &Config{
-		BotToken:  getEnv("BOT_TOKEN", ""),
-		RedisAddr: getEnv("REDIS_ADDR", "localhost:6379"),
+		BotToken:      getEnv("BOT_TOKEN", ""),
+		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""), // empty = no auth (backward compatible)
 		// One concurrent yt-dlp+ffmpeg pipeline is the safe ceiling on a
 		// 4 GB SBC: downloads land in tmpfs and merging peaks in the
 		// hundreds of MB. Raise only for audio-only workloads.
