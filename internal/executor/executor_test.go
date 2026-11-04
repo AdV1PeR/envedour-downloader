@@ -723,10 +723,11 @@ func TestGetFormatForQualityHighRes(t *testing.T) {
 		if !strings.Contains(f, "height<=") {
 			t.Errorf("%s selector missing height filter: %s", q, f)
 		}
-		// High-res sources are often webm/vp9: no container filter, so the
-		// best codec available is chosen and remuxed to mp4.
-		if strings.Contains(f, "ext=") {
-			t.Errorf("%s selector must not filter by container: %s", q, f)
+		// High-res sources are often webm/vp9: the VIDEO alternatives must
+		// have no container filter (the remux converts the container), while
+		// preferring m4a audio keeps the mp4 merge clean.
+		if strings.Contains(f, "[ext=mp4]") {
+			t.Errorf("%s selector must not filter video by mp4 container: %s", q, f)
 		}
 	}
 }

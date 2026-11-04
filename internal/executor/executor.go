@@ -1653,15 +1653,6 @@ func (e *Executor) downloadMedia(ctx context.Context, url, jobID, quality, media
 		args = addTikTokArgs(args, true)
 	}
 
-	if isYouTubeURL(url) {
-		// YouTube frequently blocks requests from default web client without
-		// cookies. Using the Android player client is often more reliable and
-		// works without cookies for many videos. yt-dlp also needs a JavaScript
-		// runtime (Deno / Node 22+) to decrypt the player, which is added below
-		// via addYTDLPJavaScriptRuntime.
-		args = append(args, "--extractor-args", "youtube:player_client=android")
-	}
-
 	// Set format based on media type and quality.
 	args = append(args, e.mediaTypeArgs(mediaType, quality)...)
 
@@ -1905,6 +1896,12 @@ func (e *Executor) mediaTypeArgs(mediaType, quality string) []string {
 	// which yt-dlp saves as *.unknown_video. Force a real MP4 container:
 	// merge for split video+audio jobs, remux (stream copy) for single
 	// formats. Both are no-ops for sources already in MP4.
+	//
+	// NOTE: the "best" selector intentionally has no container filter —
+	// YouTube's high resolutions (1440p+, 120fps) exist only as webm/vp9 or
+	// av01, and the remux below converts the container losslessly. Do not
+	// force youtube:player_client=android either: YouTube restricted that
+	// client to a single 360p muxed format.
 	return []string{
 		"--format", e.getFormatForQuality(quality),
 		"--merge-output-format", "mp4",
@@ -1917,11 +1914,11 @@ func (e *Executor) getFormatForQuality(quality string) string {
 	case "1080p":
 		return "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
 	case "1440p":
-		return "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best"
+		return "bestvideo[height<=1440]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best"
 	case "2160p":
-		return "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
+		return "bestvideo[height<=2160]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
 	case "4320p":
-		return "bestvideo[height<=4320]+bestaudio/best[height<=4320]/best"
+		return "bestvideo[height<=4320]+bestaudio[ext=m4a]/bestvideo[height<=4320]+bestaudio/best[height<=4320]/best"
 	case "720p":
 		return "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
 	case "480p":
@@ -1931,7 +1928,10 @@ func (e *Executor) getFormatForQuality(quality string) string {
 	case "audio":
 		return "bestaudio[ext=m4a]/bestaudio/best"
 	default: // "best"
-		return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+		// No container filter: pick the true best (webm/vp9, av01 at high
+		// resolutions) — the remux converts it to mp4. Audio prefers m4a
+		// (aac) for a clean mp4 merge.
+		return "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 	}
 }
 
