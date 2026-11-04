@@ -1759,6 +1759,13 @@ func cleanAudioTitle(raw string) string {
 // fetchAudioThumbnail downloads a cover art URL and turns it into a JPEG
 // fitting Telegram's 320x320 preview limit, reusing generateThumbnail.
 func (e *Executor) fetchAudioThumbnail(ctx context.Context, thumbURL string) string {
+	// Only real web URLs: the thumbnail URL comes from site metadata, and a
+	// crafted one must not probe the local network with exotic schemes.
+	parsed, err := url.Parse(thumbURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return ""
+	}
+
 	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
