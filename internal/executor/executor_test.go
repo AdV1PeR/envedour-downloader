@@ -731,3 +731,16 @@ func TestGetFormatForQualityHighRes(t *testing.T) {
 		}
 	}
 }
+
+func TestParseMemInfoValue(t *testing.T) {
+	data := "MemTotal:        4026408 kB\nMemFree:          242228 kB\nMemAvailable:    2076200 kB\nShmem:            116620 kB\nSwapTotal:       2012156 kB\n"
+	if kb, ok := parseMemInfoValue(data, "MemAvailable"); !ok || kb != 2076200 {
+		t.Fatalf("MemAvailable = %d (found %v), want 2076200", kb, ok)
+	}
+	if kb, ok := parseMemInfoValue(data, "MemFree"); !ok || kb != 242228 {
+		t.Fatalf("MemFree = %d (found %v), want 242228", kb, ok)
+	}
+	if _, ok := parseMemInfoValue(data, "SwapFree"); ok {
+		t.Fatal("a missing field must not be found")
+	}
+}

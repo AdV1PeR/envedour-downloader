@@ -2128,21 +2128,94 @@ func (e *Executor) sendMessage(chatID int64, text string) {
 	e.botAPI.Send(msg)
 }
 
+// Janitor periodically removes leftovers from tmpfs (which IS device RAM)
+// and the archive directory: crashed runs leave .part files and half-written
+// parts behind, and stale tmpfs files permanently eat device memory — the
+// 294 MB of dead .part files found on the device were exactly that. Files
+// are only removed when they have not been written for the grace period, so
+// active downloads (whose .part files are updated continuously) are never
+// touched.
+func (e *Executor) Janitor(ctx context.Context) {
+	run := func() {
+		e.cleanDir(e.config.TmpfsPath, 2*time.Hour)
+		e.cleanDir(e.config.ArchiveDir, 24*time.Hour)
+	}
+	run()
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+// cleanDir removes files in dir that have not been modified for olderThan.
+func (e *Executor) cleanDir(dir string, olderThan time.Duration) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || time.Since(info.ModTime()) < olderThan {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err == nil {
+			log.Printf("Janitor: removed stale %s", filepath.Join(dir, entry.Name()))
+		}
+	}
+}
+
+// parseMemInfoValue extracts a field (e.g. "MemAvailable") from
+// /proc/meminfo content. Values are in kB.
+func parseMemInfoValue(data, field string) (int64, bool) {
+	for _, line := range strings.Split(data, "\n") {
+		if strings.HasPrefix(line, field+":") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					return kb, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// checkMemory makes sure the device has enough *available* memory for
+// another download. Sysinfo.Freeram (= MemFree) is misleading: on Linux most
+// free RAM sits in the page cache, and MemFree can stay well below any
+// threshold for days while MemAvailable is plentiful — which made the bot
+// reject every download. The kernel's MemAvailable estimate is the correct
+// metric; Sysinfo is only a fallback when /proc/meminfo cannot be read.
 func (e *Executor) checkMemory() error {
+	minMB := int64(e.config.MinFreeMemMB)
+
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		if kb, ok := parseMemInfoValue(string(data), "MemAvailable"); ok {
+			availMB := kb / 1024
+			if availMB < minMB {
+				return fmt.Errorf("MemAvailable: %d MB (minimum: %d MB)", availMB, minMB)
+			}
+			return nil
+		}
+	}
+
 	var info syscall.Sysinfo_t
 	if err := syscall.Sysinfo(&info); err != nil {
 		return err
 	}
-
-	// Use configurable minimum free memory (default 256MB)
-	minFreeMemory := uint64(e.config.MinFreeMemMB * 1024 * 1024)
-	freeMB := info.Freeram / (1024 * 1024)
-
-	if info.Freeram < minFreeMemory {
-		log.Printf("Memory check failed: %d MB free (minimum: %d MB)", freeMB, e.config.MinFreeMemMB)
-		return fmt.Errorf("insufficient memory: %d MB free (minimum: %d MB)", freeMB, e.config.MinFreeMemMB)
+	freeMB := int64(info.Freeram) / (1024 * 1024)
+	if freeMB < minMB {
+		return fmt.Errorf("Freeram: %d MB (minimum: %d MB)", freeMB, minMB)
 	}
-
 	return nil
 }
 

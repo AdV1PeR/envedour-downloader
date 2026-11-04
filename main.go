@@ -87,6 +87,9 @@ func main() {
 		}()
 	}
 
+	// Janitor: clean stale tmpfs/archive leftovers from crashed runs.
+	go exec.Janitor(workerCtx)
+
 	// Start bot
 	go envedourBot.Start(botCtx)
 
