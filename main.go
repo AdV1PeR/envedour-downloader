@@ -35,7 +35,7 @@ func main() {
 
 	// Initialize Redis queue
 	log.Printf("Connecting to Redis at %s...", cfg.RedisAddr)
-	redisQueue, err := queue.NewRedisQueue(cfg.RedisAddr)
+	redisQueue, err := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisPassword)
 	if err != nil {
 		log.Fatalf("Failed to connect to Redis: %v", err)
 	}

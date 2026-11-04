@@ -48,9 +48,10 @@ type RedisQueue struct {
 	ctx    context.Context
 }
 
-func NewRedisQueue(addr string) (*RedisQueue, error) {
+func NewRedisQueue(addr, password string) (*RedisQueue, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:         addr,
+		Password:     password,
 		MaxRetries:   3,
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,

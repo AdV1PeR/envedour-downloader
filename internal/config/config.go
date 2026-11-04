@@ -13,6 +13,7 @@ import (
 type Config struct {
 	BotToken         string
 	RedisAddr        string
+	RedisPassword    string // empty = no auth
 	WorkerCount      int
 	TmpfsPath        string
 	MaxFileSize      int64
