@@ -27,11 +27,14 @@ type Config struct {
 	AdminChatID      int64  // Telegram chat for service reminders (0 = disabled)
 
 	// Anti-spam and resource guards
-	AllowedGroupIDs  []int64 // Group chats allowed to use the bot (empty = none)
-	RateLimitPerHour int     // Downloads per user per hour (0 = unlimited)
-	MaxQueueSize     int     // Reject new jobs beyond this queue depth (0 = no cap)
-	MinFreeTmpfsMB   int     // Stop downloading when tmpfs has less free space
-	PlaylistMaxItems int     // Cap on YouTube playlist length (0 = no cap)
+	AllowedGroupIDs []int64 // Group chats allowed to use the bot (empty = none)
+	// AllowedUserIDs: when set, private chats are limited to these Telegram
+	// users. Empty = any user may DM the bot.
+	AllowedUserIDs   []int64
+	RateLimitPerHour int // Downloads per user per hour (0 = unlimited)
+	MaxQueueSize     int // Reject new jobs beyond this queue depth (0 = no cap)
+	MinFreeTmpfsMB   int // Stop downloading when tmpfs has less free space
+	PlaylistMaxItems int // Cap on YouTube playlist length (0 = no cap)
 
 	// Playlist archives: parts are written to disk (tmpfs is RAM-backed and
 	// too small for multi-GB archives) and sent one by one.
@@ -75,6 +78,7 @@ func Load() (*Config, error) {
 		AdminChatID:      getEnvInt64("ADMIN_CHAT_ID", 0),   // Telegram chat for service reminders
 
 		AllowedGroupIDs:  parseChatIDs(getEnv("ALLOWED_GROUP_IDS", "")),
+		AllowedUserIDs:   parseChatIDs(getEnv("ALLOWED_USER_IDS", "")),
 		RateLimitPerHour: getEnvInt("RATE_LIMIT_JOBS_PER_HOUR", 12),
 		MaxQueueSize:     getEnvInt("MAX_QUEUE_SIZE", 20),
 		MinFreeTmpfsMB:   getEnvInt("MIN_FREE_TMPFS_MB", 300),

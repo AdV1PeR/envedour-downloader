@@ -120,6 +120,17 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 		return
 	}
 
+	// Private chats can be limited to known users (ALLOWED_USER_IDS) — the
+	// bot runs downloads on the owner's device and with the owner's cookies.
+	var senderID int64
+	if msg.From != nil {
+		senderID = msg.From.ID
+	}
+	if msg.Chat.IsPrivate() && !b.isUserAllowed(senderID) {
+		log.Printf("Ignoring private message from non-whitelisted user %d; add them to ALLOWED_USER_IDS to enable", senderID)
+		return
+	}
+
 	// Check if user is donor. In groups the chat is the group itself, so
 	// also credit the sender: the admin must not be throttled in their own
 	// groups.
@@ -335,16 +346,30 @@ func isTikTokURL(url string) bool {
 	return strings.Contains(url, "tiktok.com") || strings.Contains(url, "vt.tiktok.com")
 }
 
-// isGroupAllowed reports whether the bot accepts messages from this group
-// chat. Private chats are always allowed; groups must be whitelisted via
-// ALLOWED_GROUP_IDS.
-func (b *Bot) isGroupAllowed(chatID int64) bool {
-	for _, id := range b.config.AllowedGroupIDs {
-		if id == chatID {
+// idInList reports whether id is present in the whitelist.
+func idInList(list []int64, id int64) bool {
+	for _, item := range list {
+		if item == id {
 			return true
 		}
 	}
 	return false
+}
+
+// isGroupAllowed reports whether the bot accepts messages from this group
+// chat. Private chats are always allowed; groups must be whitelisted via
+// ALLOWED_GROUP_IDS.
+func (b *Bot) isGroupAllowed(chatID int64) bool {
+	return idInList(b.config.AllowedGroupIDs, chatID)
+}
+
+// isUserAllowed reports whether the bot accepts private messages from this
+// Telegram user. When ALLOWED_USER_IDS is empty, any user may DM the bot.
+func (b *Bot) isUserAllowed(userID int64) bool {
+	if len(b.config.AllowedUserIDs) == 0 {
+		return true
+	}
+	return idInList(b.config.AllowedUserIDs, userID)
 }
 
 // isYouTubePlaylistURL reports whether the link points at a YouTube playlist

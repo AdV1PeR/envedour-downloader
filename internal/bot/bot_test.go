@@ -103,3 +103,17 @@ func TestURLDedup(t *testing.T) {
 		t.Fatal("a new link must not be deduped")
 	}
 }
+
+func TestIsUserAllowed(t *testing.T) {
+	open := &Bot{config: &config.Config{}}
+	if !open.isUserAllowed(1) {
+		t.Fatal("empty whitelist must allow everyone")
+	}
+	b := &Bot{config: &config.Config{AllowedUserIDs: []int64{100}}}
+	if !b.isUserAllowed(100) {
+		t.Fatal("whitelisted user must pass")
+	}
+	if b.isUserAllowed(200) {
+		t.Fatal("non-whitelisted user must be blocked")
+	}
+}
