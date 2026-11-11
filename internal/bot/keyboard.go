@@ -2,6 +2,9 @@ package bot
 
 import (
 	"fmt"
+	"unicode/utf8"
+
+	"envedour-bot/internal/groups"
 
 	tgbotapi "github.com/OvyFlash/telegram-bot-api"
 )
@@ -86,4 +89,54 @@ func createPlaylistDeliveryKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup 
 			tgbotapi.NewInlineKeyboardButtonData("📦 Архивом", fmt.Sprintf("pl_zip:%s", jobID)),
 		),
 	)
+}
+
+// createAdminKeyboard is the /admin menu shown in a private chat.
+func createAdminKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", "admin_add"),
+			tgbotapi.NewInlineKeyboardButtonData("📋 Список", "admin_list"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("➖ Удалить", "admin_remove"),
+			tgbotapi.NewInlineKeyboardButtonData("✖️ Закрыть", "admin_close"),
+		),
+	)
+}
+
+func createAdminBackKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("◀️ Назад", "admin_menu"),
+		),
+	)
+}
+
+// createAdminRemoveKeyboard lists only dynamically added groups: env-managed
+// groups are intentionally not removable from Telegram.
+func createAdminRemoveKeyboard(list []groups.Group) tgbotapi.InlineKeyboardMarkup {
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(list)+1)
+	for _, group := range list {
+		label := group.Title
+		if label == "" {
+			label = fmt.Sprintf("%d", group.ID)
+		}
+		label = truncateRunes(label, 24)
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ "+label, fmt.Sprintf("admin_del:%d", group.ID)),
+		))
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("◀️ Назад", "admin_menu"),
+	))
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 || utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max-1]) + "…"
 }

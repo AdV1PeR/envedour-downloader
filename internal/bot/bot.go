@@ -11,6 +11,7 @@ import (
 
 	"envedour-bot/internal/config"
 	"envedour-bot/internal/executor"
+	"envedour-bot/internal/groups"
 	"envedour-bot/internal/queue"
 
 	tgbotapi "github.com/OvyFlash/telegram-bot-api"
@@ -25,6 +26,8 @@ type Bot struct {
 	preferences *PreferencesStore
 	limiter     *rateLimiter
 	dedup       *urlDedup
+	groups      *groups.Store
+	admin       *adminState
 }
 
 func NewBot(cfg *config.Config, q queue.Queue, exec *executor.Executor) (*Bot, error) {
@@ -54,6 +57,14 @@ func NewBot(cfg *config.Config, q queue.Queue, exec *executor.Executor) (*Bot, e
 		prefsStore = NewPreferencesStore(redisClient)
 	}
 
+	// Runtime group whitelist. A broken file must not stop the bot: the
+	// static ALLOWED_GROUP_IDS list still works, and the admin can re-add
+	// groups with /admin.
+	groupStore := groups.New(cfg.AllowedGroupsFile)
+	if err := groupStore.Load(); err != nil {
+		log.Printf("WARNING: cannot load dynamic group whitelist %s: %v; continuing with ALLOWED_GROUP_IDS only", cfg.AllowedGroupsFile, err)
+	}
+
 	bot := &Bot{
 		api:         api,
 		config:      cfg,
@@ -63,6 +74,8 @@ func NewBot(cfg *config.Config, q queue.Queue, exec *executor.Executor) (*Bot, e
 		workerPool:  make(chan struct{}, cfg.WorkerCount+2),
 		limiter:     newRateLimiter(),
 		dedup:       newURLDedup(5 * time.Minute),
+		groups:      groupStore,
+		admin:       newAdminState(),
 	}
 
 	return bot, nil
@@ -113,21 +126,40 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	msg := update.Message
 	chatID := msg.Chat.ID
 
-	// Group chats are opt-in via ALLOWED_GROUP_IDS: ignore everything from
-	// unlisted groups. Log the ID so the admin can copy it into .env.
+	var senderID int64
+	if msg.From != nil {
+		senderID = msg.From.ID
+	}
+	isAdmin := b.isAdmin(senderID)
+
+	// Group chats are opt-in via ALLOWED_GROUP_IDS (plus the runtime list
+	// managed by /admin). The one exception is /admin itself: an admin must
+	// be able to enable a group from inside that group.
 	if !msg.Chat.IsPrivate() && !b.isGroupAllowed(chatID) {
-		log.Printf("Ignoring message from non-whitelisted group chat %d (%s); add it to ALLOWED_GROUP_IDS to enable", chatID, msg.Chat.Title)
+		if isAdmin && msg.IsCommand() && msg.Command() == "admin" {
+			b.handleAdminCommand(msg)
+			return
+		}
+		log.Printf("Ignoring message from non-whitelisted group chat %d (%s); add it to ALLOWED_GROUP_IDS or use /admin in the group", chatID, msg.Chat.Title)
 		return
 	}
 
 	// Private chats can be limited to known users (ALLOWED_USER_IDS) — the
 	// bot runs downloads on the owner's device and with the owner's cookies.
-	var senderID int64
-	if msg.From != nil {
-		senderID = msg.From.ID
-	}
-	if msg.Chat.IsPrivate() && !b.isUserAllowed(senderID) {
+	// Admins are always allowed to reach /admin.
+	if msg.Chat.IsPrivate() && !b.isUserAllowed(senderID) && !isAdmin {
 		log.Printf("Ignoring private message from non-whitelisted user %d; add them to ALLOWED_USER_IDS to enable", senderID)
+		return
+	}
+
+	// A click on "Добавить группу" arms a one-shot prompt: the next text
+	// from this admin is treated as a group ID or @username.
+	if msg.Chat.IsPrivate() && isAdmin && !msg.IsCommand() && b.admin.consumeAddPending(senderID) {
+		if isValidURL(strings.TrimSpace(msg.Text)) {
+			b.sendMessage(chatID, "❌ Это ссылка, а не группа. Нажми «Добавить» и пришли ID группы или @username.")
+			return
+		}
+		b.handleAdminAddInput(msg, senderID)
 		return
 	}
 
@@ -138,15 +170,19 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 
 	switch {
 	case msg.IsCommand():
-		b.handleCommand(msg, isDonor)
+		b.handleCommand(msg, isDonor, isAdmin)
 	case msg.Text != "":
 		b.handleURL(msg, isDonor)
 	}
 }
 
-func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool) {
+func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool, isAdmin bool) {
 	chatID := msg.Chat.ID
 	command := msg.Command()
+
+	if isAdmin && msg.From != nil {
+		b.admin.clearAddPending(msg.From.ID)
+	}
 
 	switch command {
 	case "start":
@@ -171,6 +207,12 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, isDonor bool) {
 		return
 	case "status":
 		b.showStatus(chatID)
+	case "admin":
+		if !isAdmin {
+			b.sendMessage(chatID, "❌ Недостаточно прав.")
+			return
+		}
+		b.handleAdminCommand(msg)
 	case "stop", "cancel":
 		b.handleStop(msg)
 	case "quality", "audio", "video":
@@ -358,9 +400,20 @@ func idInList(list []int64, id int64) bool {
 
 // isGroupAllowed reports whether the bot accepts messages from this group
 // chat. Private chats are always allowed; groups must be whitelisted via
-// ALLOWED_GROUP_IDS.
+// ALLOWED_GROUP_IDS or the runtime list managed through /admin.
 func (b *Bot) isGroupAllowed(chatID int64) bool {
+	return b.isStaticGroup(chatID) || (b.groups != nil && b.groups.Contains(chatID))
+}
+
+// isStaticGroup reports whether the group comes from ALLOWED_GROUP_IDS in
+// .env. Such groups are displayed but cannot be removed with /admin.
+func (b *Bot) isStaticGroup(chatID int64) bool {
 	return idInList(b.config.AllowedGroupIDs, chatID)
+}
+
+// isAdmin reports whether this Telegram user is allowed to manage groups.
+func (b *Bot) isAdmin(userID int64) bool {
+	return idInList(b.config.AdminUserIDs, userID)
 }
 
 // isUserAllowed reports whether the bot accepts private messages from this
@@ -408,8 +461,24 @@ func generateJobID() string {
 }
 
 func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
-	chatID := query.Message.Chat.ID
 	data := query.Data
+
+	// Admin callbacks are checked before anything else and are never
+	// available to regular users.
+	if strings.HasPrefix(data, "admin_") {
+		if query.From == nil || !b.isAdmin(query.From.ID) {
+			b.api.Request(tgbotapi.NewCallbackWithAlert(query.ID, "Недостаточно прав"))
+			return
+		}
+		b.api.Request(tgbotapi.NewCallback(query.ID, ""))
+		b.handleAdminCallback(query)
+		return
+	}
+
+	if query.Message == nil {
+		return
+	}
+	chatID := query.Message.Chat.ID
 
 	// Answer callback to remove loading state
 	callback := tgbotapi.NewCallback(query.ID, "")

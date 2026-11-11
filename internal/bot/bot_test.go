@@ -1,10 +1,12 @@
 package bot
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
 	"envedour-bot/internal/config"
+	"envedour-bot/internal/groups"
 )
 
 func TestIsGroupAllowed(t *testing.T) {
@@ -115,5 +117,67 @@ func TestIsUserAllowed(t *testing.T) {
 	}
 	if b.isUserAllowed(200) {
 		t.Fatal("non-whitelisted user must be blocked")
+	}
+}
+
+func TestIsAdmin(t *testing.T) {
+	b := &Bot{config: &config.Config{AdminUserIDs: []int64{100}}}
+	if !b.isAdmin(100) {
+		t.Fatal("configured admin must be recognized")
+	}
+	if b.isAdmin(200) {
+		t.Fatal("regular user must not be an admin")
+	}
+	if (&Bot{config: &config.Config{}}).isAdmin(100) {
+		t.Fatal("empty ADMIN_USER_IDS must disable /admin")
+	}
+}
+
+func TestDynamicGroupWhitelist(t *testing.T) {
+	store := groups.New(filepath.Join(t.TempDir(), "allowed_groups.json"))
+	b := &Bot{
+		config: &config.Config{AllowedGroupIDs: []int64{-1001}},
+		groups: store,
+	}
+
+	if !b.isGroupAllowed(-1001) {
+		t.Fatal("static env group must be allowed")
+	}
+	if b.isGroupAllowed(-1002) {
+		t.Fatal("unknown group must be blocked before /admin")
+	}
+	if _, _, err := store.Add(-1002, "runtime", 100); err != nil {
+		t.Fatalf("store.Add(): %v", err)
+	}
+	if !b.isGroupAllowed(-1002) {
+		t.Fatal("runtime group must be allowed without a restart")
+	}
+	if !b.isStaticGroup(-1001) {
+		t.Fatal("env group must be marked static")
+	}
+	if b.isStaticGroup(-1002) {
+		t.Fatal("runtime group must not be marked static")
+	}
+}
+
+func TestAdminAddPromptIsOneShot(t *testing.T) {
+	state := newAdminState()
+	state.setAddPending(100)
+	if !state.consumeAddPending(100) {
+		t.Fatal("armed prompt must be consumed")
+	}
+	if state.consumeAddPending(100) {
+		t.Fatal("prompt must be one-shot")
+	}
+	if state.consumeAddPending(200) {
+		t.Fatal("another user must not inherit a pending prompt")
+	}
+
+	state.setAddPending(300)
+	state.mu.Lock()
+	state.addPending[300] = time.Now().Add(-time.Second)
+	state.mu.Unlock()
+	if state.consumeAddPending(300) {
+		t.Fatal("expired prompt must not be consumed")
 	}
 }

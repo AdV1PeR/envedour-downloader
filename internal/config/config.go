@@ -30,11 +30,17 @@ type Config struct {
 	AllowedGroupIDs []int64 // Group chats allowed to use the bot (empty = none)
 	// AllowedUserIDs: when set, private chats are limited to these Telegram
 	// users. Empty = any user may DM the bot.
-	AllowedUserIDs   []int64
-	RateLimitPerHour int // Downloads per user per hour (0 = unlimited)
-	MaxQueueSize     int // Reject new jobs beyond this queue depth (0 = no cap)
-	MinFreeTmpfsMB   int // Stop downloading when tmpfs has less free space
-	PlaylistMaxItems int // Cap on YouTube playlist length (0 = no cap)
+	AllowedUserIDs []int64
+	// AdminUserIDs: users allowed to manage the dynamic group whitelist via
+	// /admin. Empty disables /admin.
+	AdminUserIDs []int64
+	// AllowedGroupsFile persists groups added through /admin. The bot user
+	// must be able to create and replace this file.
+	AllowedGroupsFile string
+	RateLimitPerHour  int // Downloads per user per hour (0 = unlimited)
+	MaxQueueSize      int // Reject new jobs beyond this queue depth (0 = no cap)
+	MinFreeTmpfsMB    int // Stop downloading when tmpfs has less free space
+	PlaylistMaxItems  int // Cap on YouTube playlist length (0 = no cap)
 
 	// Playlist archives: parts are written to disk (tmpfs is RAM-backed and
 	// too small for multi-GB archives) and sent one by one.
@@ -77,8 +83,13 @@ func Load() (*Config, error) {
 		MinFreeMemMB:     getEnvInt("MIN_FREE_MEM_MB", 256), // Minimum free memory in MB
 		AdminChatID:      getEnvInt64("ADMIN_CHAT_ID", 0),   // Telegram chat for service reminders
 
-		AllowedGroupIDs:  parseChatIDs(getEnv("ALLOWED_GROUP_IDS", "")),
-		AllowedUserIDs:   parseChatIDs(getEnv("ALLOWED_USER_IDS", "")),
+		AllowedGroupIDs: parseChatIDs(getEnv("ALLOWED_GROUP_IDS", "")),
+		AllowedUserIDs:  parseChatIDs(getEnv("ALLOWED_USER_IDS", "")),
+		AdminUserIDs:    parseChatIDs(getEnv("ADMIN_USER_IDS", "")),
+		AllowedGroupsFile: getEnv(
+			"ALLOWED_GROUPS_FILE",
+			"/opt/envedour-bot/allowed_groups.json",
+		),
 		RateLimitPerHour: getEnvInt("RATE_LIMIT_JOBS_PER_HOUR", 12),
 		MaxQueueSize:     getEnvInt("MAX_QUEUE_SIZE", 20),
 		MinFreeTmpfsMB:   getEnvInt("MIN_FREE_TMPFS_MB", 300),
